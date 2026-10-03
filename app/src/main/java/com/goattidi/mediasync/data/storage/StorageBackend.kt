@@ -79,7 +79,13 @@ interface StorageBackend {
         /** Destination container id, or null for the backend root. */
         val destinationId: String? = null,
         /** In-flight session to continue (Drive session URI, S3 multipart upload id). */
-        val existingSession: String? = null
+        val existingSession: String? = null,
+        /**
+         * An identifier that is stable for one local file and distinct from every other
+         * one. A backend whose object names must be unique uses it to disambiguate; Drive
+         * allows same-named files in one folder and ignores it.
+         */
+        val uniqueId: String? = null
     )
 
     /**
