@@ -61,9 +61,14 @@ class VerifyEngine @Inject constructor(
                 unverified++
                 continue
             }
-            // What the local bytes must report, which for a backend whose checksum depends
-            // on upload chunking costs a pass over the file.
-            val expected = backend.expectedLocalChecksum(record)
+            // What the local bytes must report. The record's cached MD5 is already known
+            // current, so this costs nothing beyond what the backend itself has to derive.
+            val localMd5 = record.localMd5
+            val expected = if (record.md5IsCurrent) {
+                backend.storedChecksumForFreshBytes(record, localMd5!!)
+            } else {
+                null
+            }
             when {
                 expected == null -> unverified++
                 remoteChecksum.equals(expected, ignoreCase = true) -> {

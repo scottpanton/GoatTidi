@@ -75,12 +75,12 @@ class ReclaimEngine @Inject constructor(
         val remoteChecksum = remote.checksum
             ?: return Gate.Blocked("${backend.displayName} has not produced a checksum for this file")
 
-        // Fresh local check: hash the bytes as they are RIGHT NOW, not the cached value
+        // Fresh local check: hash the bytes as they are RIGHT NOW, not the cached value.
+        // The backend decides what checksum those bytes must produce in storage — usually
+        // this very hash, but not for an object stored in parts.
         val freshLocalMd5 = Md5.of(localFiles.open(record, 0))
-        val expected = backend.expectedLocalChecksum(record) ?: freshLocalMd5
-        if (!freshLocalMd5.equals(expected, ignoreCase = true) ||
-            !expected.equals(remoteChecksum, ignoreCase = true)
-        ) {
+        val expected = backend.storedChecksumForFreshBytes(record, freshLocalMd5)
+        if (expected == null || !expected.equals(remoteChecksum, ignoreCase = true)) {
             repository.markModifiedSinceUpload(mediaStoreId)
             return Gate.Blocked("Local file was modified since upload — current bytes are not stored")
         }

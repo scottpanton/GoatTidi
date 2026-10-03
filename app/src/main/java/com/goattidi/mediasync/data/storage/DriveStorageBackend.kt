@@ -77,6 +77,16 @@ class DriveStorageBackend(
     /** Drive already cached the MD5 alongside the bytes it describes, so this is free. */
     override suspend fun expectedLocalChecksum(record: SyncRecord): String? = record.localMd5
 
+    /**
+     * Drive stores the whole-content MD5, so the freshly computed hash is already the
+     * answer. Returning it unchanged is what keeps the free-up-space gate identical to
+     * what it was before a second backend existed.
+     */
+    override suspend fun storedChecksumForFreshBytes(
+        record: SyncRecord,
+        wholeFileMd5: String
+    ): String? = wholeFileMd5
+
     override suspend fun stat(objectId: String): RemoteObject =
         translating { client.getFile(objectId) }.toRemoteObject()
 

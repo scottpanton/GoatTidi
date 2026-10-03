@@ -60,6 +60,20 @@ class S3StorageBackend(
         else -> compositeEtagOf(record)
     }
 
+    /**
+     * A single-request PUT's ETag is the file's MD5, so the fresh hash answers it. A
+     * multipart object's ETag is an MD5 of per-part MD5s, which has to be recomputed from
+     * the file — without this, a large upload could never pass the free-up-space gate,
+     * because its stored checksum is not the file's MD5.
+     */
+    override suspend fun storedChecksumForFreshBytes(
+        record: SyncRecord,
+        wholeFileMd5: String
+    ): String? = when {
+        record.sizeBytes <= partSizeBytes -> wholeFileMd5
+        else -> compositeEtagOf(record)
+    }
+
     override suspend fun upload(
         request: StorageBackend.UploadRequest,
         source: StorageBackend.Source,

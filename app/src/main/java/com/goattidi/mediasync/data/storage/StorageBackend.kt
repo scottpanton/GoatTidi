@@ -132,15 +132,30 @@ interface StorageBackend {
     suspend fun stat(objectId: String): RemoteObject
 
     /**
-     * The checksum this backend's stored bytes must report for [record]'s local file,
-     * or null when the local bytes have no trustworthy checksum yet.
+     * The checksum this backend's stored bytes must report for [record]'s local file, or
+     * null when the local bytes have no trustworthy checksum yet.
      *
-     * Verify and reclaim compare this against the remote checksum. Backends whose
-     * stored checksum is the same MD5 the app already cached can answer for free; a
-     * backend whose checksum depends on how the bytes were chunked for upload has to
-     * re-read the file in the same chunking.
+     * Used where the local hash is already cached and current, so verify and resume cost
+     * nothing extra on the backends that store it verbatim.
      */
     suspend fun expectedLocalChecksum(record: SyncRecord): String?
+
+    /**
+     * The checksum the stored object must report, given [wholeFileMd5] computed from the
+     * bytes as they are right now.
+     *
+     * This is the honest form of the question Reclaim and Verify have to ask, and the two
+     * backends answer it differently. Drive — and any S3 object small enough for a single
+     * request — stores that MD5 unchanged, so the answer is the value passed in. A backend
+     * whose stored checksum reflects how the file was chunked for upload (an S3 multipart
+     * ETag is an MD5 of per-part MD5s) has to recompute it from the file, which is why the
+     * record is needed as well.
+     *
+     * Returning the argument unchanged is always correct, so a backend only overrides this
+     * when its stored checksum genuinely differs from the file's MD5.
+     */
+    suspend fun storedChecksumForFreshBytes(record: SyncRecord, wholeFileMd5: String): String? =
+        expectedLocalChecksum(record)?.takeIf { wholeFileMd5.isNotBlank() }
 
     /** Finds-or-creates a container by name, reusing one this app created. */
     suspend fun ensureContainer(name: String, parentId: String? = null): String

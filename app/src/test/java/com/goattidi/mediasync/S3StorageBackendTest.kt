@@ -19,6 +19,7 @@ import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -214,6 +215,31 @@ class S3StorageBackendTest {
         val composite = s3.expectedLocalChecksum(record(size = partSize + 1, md5 = "abc"))
         assertEquals("multipart needs the composite, so the file must be read", 1, reads.get())
         assertTrue("expected a composite etag but got $composite", composite!!.endsWith("-2"))
+    }
+
+    @Test
+    fun `a stored checksum for fresh bytes is the fresh hash for a single-request put`() = runTest {
+        // What the free-up-space gate asks. For a single-request PUT the answer must be the
+        // hash it was handed, unchanged, or the gate would stop recognising Drive's own
+        // checksums.
+        val record = record(size = 500, md5 = "cached-but-different")
+        assertEquals("fresh-md5", backend.storedChecksumForFreshBytes(record, "fresh-md5"))
+    }
+
+    @Test
+    fun `a multipart object is checked against a composite recomputed from the file`() = runTest {
+        val record = record(size = partSize + 1, md5 = "cached-but-different")
+        // Sized to the record, so the composite pass has real bytes to read.
+        val sized = buildBackend(FakeLocalReads(AtomicInteger()))
+
+        val expected = sized.storedChecksumForFreshBytes(record, "fresh-md5")
+
+        assertTrue("expected a composite etag but got $expected", expected!!.endsWith("-2"))
+        assertNotEquals(
+            "a multipart object's stored checksum is not the file's MD5",
+            "fresh-md5",
+            expected
+        )
     }
 
     @Test
