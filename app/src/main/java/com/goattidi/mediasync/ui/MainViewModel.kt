@@ -14,6 +14,7 @@ import com.goattidi.mediasync.data.drive.DriveAuthProvider
 import com.goattidi.mediasync.data.drive.DriveClient
 import com.goattidi.mediasync.data.drive.DriveException
 import com.goattidi.mediasync.data.drive.DriveFile
+import com.goattidi.mediasync.data.storage.StorageRouter
 import com.goattidi.mediasync.data.repo.DriveLayout
 import com.goattidi.mediasync.data.repo.SyncSettings
 import com.goattidi.mediasync.data.repo.SyncStateRepository
@@ -76,7 +77,8 @@ class MainViewModel @Inject constructor(
     private val reclaimEngine: ReclaimEngine,
     private val authProvider: DriveAuthProvider,
     private val settings: SyncSettings,
-    private val driveClient: DriveClient
+    private val driveClient: DriveClient,
+    private val storageRouter: StorageRouter
 ) : ViewModel() {
 
     /** One level of the Drive folder browser. Breadcrumb starts at ("root", "My Drive"). */
@@ -398,12 +400,12 @@ class MainViewModel @Inject constructor(
             val message = when {
                 // Own files across the whole Drive — this app's uploads included
                 externalId == DRIVE_ROOT_ID -> {
-                    val imported = verifyEngine.importEntireDrive()
+                    val imported = verifyEngine.importEverything()
                     settings.setLastSyncScanAt(System.currentTimeMillis())
                     "Sync search: indexed $imported file(s) across your Drive"
                 }
                 externalPath.isEmpty() -> {
-                    val own = verifyEngine.importLedgerFromDrive()
+                    val own = verifyEngine.importLedger()
                     "Sync search: indexed $own of this app's upload(s)"
                 }
                 else -> {
@@ -411,13 +413,13 @@ class MainViewModel @Inject constructor(
                     // then keep the id so later scans skip the lookup (and survive renames)
                     val folderId = externalId.takeIf { it.isNotEmpty() }
                         ?: driveClient.resolveFolderPath(externalPath)?.also { settings.setDedupFolder(externalPath, it) }
-                    val result = if (folderId != null) verifyEngine.scanOwnUploadsAndFolder(folderId)
-                    else VerifyEngine.SyncScanResult(verifyEngine.importLedgerFromDrive(), null)
-                    if (result.inFolder == null) {
+                    val result = if (folderId != null) verifyEngine.scanOwnUploadsAndContainer(folderId)
+                    else VerifyEngine.SyncScanResult(verifyEngine.importLedger(), null)
+                    if (result.inContainer == null) {
                         "Sync search folder \"$externalPath\" is gone from Drive — choose another"
                     } else {
                         settings.setLastSyncScanAt(System.currentTimeMillis())
-                        "Sync search: indexed ${result.inFolder} file(s) in \"$externalPath\" and " +
+                        "Sync search: indexed ${result.inContainer} file(s) in \"$externalPath\" and " +
                             "${result.own} of this app's upload(s)"
                     }
                 }
@@ -449,7 +451,7 @@ class MainViewModel @Inject constructor(
      */
     private suspend fun ensureOwnLedger() {
         if (ledgerChecked) return
-        if (repository.ledgerIsEmpty()) verifyEngine.importLedgerFromDrive()
+        if (repository.ledgerIsEmpty(backendId())) verifyEngine.importLedger()
         ledgerChecked = true
     }
 
@@ -667,6 +669,8 @@ class MainViewModel @Inject constructor(
         is DriveException -> "Google Drive error: ${e.message}"
         else -> "Error: ${e.message}"
     }
+
+    private suspend fun backendId(): String = storageRouter.backend().id.name
 
     private companion object {
         /** Picker label for the top of My Drive; as the sync-search folder it means "entire Drive". */

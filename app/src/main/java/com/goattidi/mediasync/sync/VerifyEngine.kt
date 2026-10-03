@@ -1,21 +1,27 @@
 package com.goattidi.mediasync.sync
 
-import com.goattidi.mediasync.data.drive.DriveClient
-import com.goattidi.mediasync.data.drive.DriveException
 import com.goattidi.mediasync.data.drive.RetryPolicy
-import com.goattidi.mediasync.data.drive.withRetry
 import com.goattidi.mediasync.data.repo.SyncStateRepository
+import com.goattidi.mediasync.data.storage.StorageBackendProvider
+import com.goattidi.mediasync.data.storage.StorageException
+import com.goattidi.mediasync.data.storage.withStorageRetry
 import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * The Verify action (§4.5): batch-checks every record that claims a Drive file,
- * updating statuses from what Drive actually reports — never from local assumptions.
+ * The Verify action (§4.5): batch-checks every record that claims a remote object,
+ * updating statuses from what the backend actually reports — never from local assumptions.
+ *
+ * Everything here is expressed in backend-neutral terms, which is what makes the same pass
+ * meaningful for Drive and S3 alike. Where the two genuinely differ, the difference is
+ * carried by the data rather than by a branch: S3 objects are never in a trash, so
+ * [RemoteObject.trashed] is simply false, and every object in a bucket is owned by whoever
+ * holds its credentials, so [RemoteObject.ownedByUser] is simply true.
  */
 @Singleton
 class VerifyEngine @Inject constructor(
     private val repository: SyncStateRepository,
-    private val client: DriveClient
+    private val router: StorageBackendProvider
 ) {
     data class Summary(
         val checked: Int,
@@ -30,13 +36,16 @@ class VerifyEngine @Inject constructor(
         var orphaned = 0
         var modified = 0
         var unverified = 0
-        val candidates = repository.recordsWithDriveFile()
+        val backend = router.backend()
+        // Only records whose object belongs to this backend: an id from the other one would
+        // describe nothing to the service being asked.
+        val candidates = repository.recordsWithRemoteObject(backend.id.name)
 
         for (record in candidates) {
-            val driveFileId = record.driveFileId ?: continue
+            val objectId = record.driveFileId ?: continue
             val remote = try {
-                withRetry(retryPolicy) { client.getFile(driveFileId) }
-            } catch (e: DriveException.NotFound) {
+                withStorageRetry(retryPolicy) { backend.stat(objectId) }
+            } catch (e: StorageException.NotFound) {
                 repository.markOrphaned(record.mediaStoreId)
                 orphaned++
                 continue
@@ -46,17 +55,19 @@ class VerifyEngine @Inject constructor(
                 orphaned++
                 continue
             }
-            val remoteMd5 = remote.md5Checksum
-            if (remoteMd5 == null) {
-                // Drive still hasn't produced a checksum — cannot be promoted (invariant #1)
+            val remoteChecksum = remote.checksum
+            if (remoteChecksum == null) {
+                // The backend cannot attest a checksum yet — cannot be promoted (invariant #1)
                 unverified++
                 continue
             }
+            // What the local bytes must report, which for a backend whose checksum depends
+            // on upload chunking costs a pass over the file.
+            val expected = backend.expectedLocalChecksum(record)
             when {
-                // Only a current local MD5 can be compared against Drive's
-                !record.md5IsCurrent -> unverified++
-                remoteMd5.equals(record.localMd5, ignoreCase = true) -> {
-                    repository.confirmSynced(record.mediaStoreId, remoteMd5)
+                expected == null -> unverified++
+                remoteChecksum.equals(expected, ignoreCase = true) -> {
+                    repository.confirmSynced(record.mediaStoreId, backend.id.name, remoteChecksum)
                     confirmed++
                 }
                 else -> {
@@ -69,21 +80,21 @@ class VerifyEngine @Inject constructor(
     }
 
     /**
-     * Rebuilds the upload ledger from Drive itself: pages through every file the
-     * app can see (its own uploads, in whatever folder they live now) and records
-     * their checksums. Restores cross-folder dedup after a reinstall or DB loss.
-     * Returns the number of ledger entries imported.
+     * Rebuilds the upload ledger from the backend itself: pages through the objects this app
+     * is the author of and records their checksums. Restores cross-folder dedup after a
+     * reinstall or DB loss. Returns the number of ledger entries imported.
      */
-    suspend fun importLedgerFromDrive(retryPolicy: RetryPolicy = RetryPolicy()): Int {
+    suspend fun importLedger(retryPolicy: RetryPolicy = RetryPolicy()): Int {
+        val backend = router.backend()
         var imported = 0
         var pageToken: String? = null
         val now = System.currentTimeMillis()
         do {
-            val page = withRetry(retryPolicy) { client.listFiles(pageToken) }
-            for (file in page.files) {
-                val md5 = file.md5Checksum ?: continue // Docs/Sheets etc. have no checksum
+            val page = withStorageRetry(retryPolicy) { backend.listOwnObjects(pageToken) }
+            for (entry in page.objects) {
+                val checksum = entry.checksum ?: continue // nothing to dedup on
                 repository.recordUploaded(
-                    md5, file.id, file.name ?: "", file.size?.toLongOrNull() ?: 0L, now
+                    backend.id.name, checksum, entry.id, entry.name ?: "", entry.sizeBytes ?: 0L, now
                 )
                 imported++
             }
@@ -92,71 +103,84 @@ class VerifyEngine @Inject constructor(
         return imported
     }
 
-    /** Counts from a sync scan. [inFolder] is null when the chosen folder is gone from Drive. */
-    data class SyncScanResult(val own: Int, val inFolder: Int?)
+    /** Counts from a sync scan. [inContainer] is null when the chosen container is gone. */
+    data class SyncScanResult(val own: Int, val inContainer: Int?)
 
     /**
-     * Sync scan for a chosen folder — how uploads from OTHER tools (rclone, Drive web)
-     * become known duplicates — together with the app's own uploads, in one pass over
-     * Drive. Requires the read-only scope; files outside the folder tree are skipped
-     * unless this app created them, and so are files in the tree that other people own
-     * (a shared folder's contributors can delete their copies at any time — the same
-     * rule as the entire-Drive scan).
+     * Sync scan for a chosen container — how uploads from OTHER tools (rclone, a desktop
+     * client, the bucket's web UI) become known duplicates — together with the app's own
+     * uploads, in one pass over the bucket.
      *
-     * Under drive.readonly, listing the app's own uploads already pages through the
-     * whole Drive, so those same pages supply the folder's files. Which files sit in the
-     * folder comes from one listing of every folder, not a walk of the tree with a
-     * request per subfolder — that walk dominated scan time on real Drives.
+     * One flat listing of every container supplies the tree, rather than a walk with a
+     * request per subcontainer: that walk dominated scan time on real Drives, and the
+     * listing that serves it is already being made.
      */
-    suspend fun scanOwnUploadsAndFolder(folderId: String, retryPolicy: RetryPolicy = RetryPolicy()): SyncScanResult {
-        val folder = try {
-            withRetry(retryPolicy) { client.getFile(folderId, fields = "id,trashed") }
-        } catch (e: DriveException.NotFound) {
+    suspend fun scanOwnUploadsAndContainer(
+        containerId: String,
+        retryPolicy: RetryPolicy = RetryPolicy()
+    ): SyncScanResult {
+        val backend = router.backend()
+        val container = try {
+            withStorageRetry(retryPolicy) { backend.stat(containerId) }
+        } catch (e: StorageException.NotFound) {
             null
         }
-        if (folder == null || folder.trashed) return SyncScanResult(importLedgerFromDrive(retryPolicy), null)
+        // Only "gone" disqualifies the container. Asking whether it looks like a container
+        // would be wrong for Drive, which answers the minimal field set asked of it here.
+        if (container == null) {
+            return SyncScanResult(importLedger(retryPolicy), null)
+        }
 
         val parentsOf = HashMap<String, List<String>>()
         var pageToken: String? = null
         do {
-            val page = withRetry(retryPolicy) { client.listAllFolders(pageToken) }
-            for (f in page.files) parentsOf[f.id] = f.parents
-            pageToken = page.nextPageToken
-        } while (pageToken != null)
-        val tree = FolderTree(folderId, parentsOf)
-
-        var own = 0
-        var inFolder = 0
-        val now = System.currentTimeMillis()
-        do {
-            val page = withRetry(retryPolicy) { client.listAllFiles(pageToken) }
-            for (file in page.files) {
-                val md5 = file.md5Checksum ?: continue // Docs/Sheets etc. have no checksum
-                val mine = file.isAppAuthorized
-                val inside = file.ownedByMe && file.parents.any(tree::contains)
-                if (!mine && !inside) continue
-                repository.recordUploaded(md5, file.id, file.name ?: "", file.size?.toLongOrNull() ?: 0L, now)
-                if (mine) own++
-                if (inside) inFolder++
+            val page = withStorageRetry(retryPolicy) { backend.listContainers(pageToken) }
+            for (entry in page.objects) {
+                // Every object names the container it sits in, so one parent link per
+                // container is enough to walk the tree in either backend.
+                parentsOf[entry.id] = listOfNotNull(entry.parentId)
             }
             pageToken = page.nextPageToken
         } while (pageToken != null)
-        return SyncScanResult(own, inFolder)
+        val tree = ContainerTree(containerId, parentsOf)
+
+        var own = 0
+        var inContainer = 0
+        val now = System.currentTimeMillis()
+        do {
+            val page = withStorageRetry(retryPolicy) { backend.listAllObjects(pageToken) }
+            for (entry in page.objects) {
+                val checksum = entry.checksum ?: continue // nothing to dedup on
+                val mine = entry.ownedByUs
+                val inside = entry.ownedByUser && entry.parentId?.let(tree::contains) == true
+                if (!mine && !inside) continue
+                repository.recordUploaded(
+                    backend.id.name, checksum, entry.id, entry.name ?: "", entry.sizeBytes ?: 0L, now
+                )
+                if (mine) own++
+                if (inside) inContainer++
+            }
+            pageToken = page.nextPageToken
+        } while (pageToken != null)
+        return SyncScanResult(own, inContainer)
     }
 
     /**
-     * Sync scan for the entire Drive: one flat listing of the user's own files, which
-     * also covers this app's uploads. Files merely shared with the user are left out.
+     * Sync scan for the whole bucket: one flat listing, which also covers this app's
+     * uploads.
      */
-    suspend fun importEntireDrive(retryPolicy: RetryPolicy = RetryPolicy()): Int {
+    suspend fun importEverything(retryPolicy: RetryPolicy = RetryPolicy()): Int {
+        val backend = router.backend()
         var imported = 0
         var pageToken: String? = null
         val now = System.currentTimeMillis()
         do {
-            val page = withRetry(retryPolicy) { client.listOwnedFiles(pageToken) }
-            for (file in page.files) {
-                val md5 = file.md5Checksum ?: continue
-                repository.recordUploaded(md5, file.id, file.name ?: "", file.size?.toLongOrNull() ?: 0L, now)
+            val page = withStorageRetry(retryPolicy) { backend.listObjectsOwnedByUser(pageToken) }
+            for (entry in page.objects) {
+                val checksum = entry.checksum ?: continue
+                repository.recordUploaded(
+                    backend.id.name, checksum, entry.id, entry.name ?: "", entry.sizeBytes ?: 0L, now
+                )
                 imported++
             }
             pageToken = page.nextPageToken
@@ -164,16 +188,17 @@ class VerifyEngine @Inject constructor(
         return imported
     }
 
-    /** Whether a folder lies inside [rootId]'s tree, answered from a parent map of every folder. */
-    private class FolderTree(private val rootId: String, private val parentsOf: Map<String, List<String>>) {
+    /** Whether a container lies inside [rootId]'s tree, from a parent map of every container. */
+    private class ContainerTree(private val rootId: String, private val parentsOf: Map<String, List<String>>) {
         private val memo = HashMap<String, Boolean>()
 
-        fun contains(folderId: String): Boolean = check(folderId, HashSet())
+        fun contains(containerId: String): Boolean = check(containerId, HashSet())
 
         private fun check(id: String, visiting: MutableSet<String>): Boolean {
             if (id == rootId) return true
             memo[id]?.let { return it }
-            if (!visiting.add(id)) return false // Drive shouldn't have cycles, but never loop on one
+            // A backend's container graph should have no cycles, but never loop on one.
+            if (!visiting.add(id)) return false
             val result = parentsOf[id].orEmpty().any { check(it, visiting) }
             memo[id] = result
             return result

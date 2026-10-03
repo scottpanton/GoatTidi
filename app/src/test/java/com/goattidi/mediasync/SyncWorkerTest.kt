@@ -15,6 +15,8 @@ import com.goattidi.mediasync.data.db.SyncStatus
 import com.goattidi.mediasync.data.drive.DriveClient
 import com.goattidi.mediasync.data.drive.DriveUploader
 import com.goattidi.mediasync.data.drive.RetryPolicy
+import com.goattidi.mediasync.data.storage.DriveStorageBackend
+import com.goattidi.mediasync.data.storage.StorageBackendProvider
 import com.goattidi.mediasync.data.hash.Md5
 import com.goattidi.mediasync.data.media.MediaStoreScanner
 import com.goattidi.mediasync.data.repo.SyncStateRepository
@@ -46,6 +48,7 @@ class SyncWorkerTest {
     private lateinit var repo: SyncStateRepository
     private lateinit var server: MockWebServer
     private lateinit var uploader: DriveUploader
+    private lateinit var backends: StorageBackendProvider
     private lateinit var files: FakeLocalFiles
 
     private val content = "hello world".toByteArray() // md5 5eb63bbbe01eeed093cb22bb8f5acdc3
@@ -77,6 +80,9 @@ class SyncWorkerTest {
         server.start()
         val client = DriveClient(FakeDriveAuth(), OkHttpClient(), server.url("/").toString())
         uploader = DriveUploader(client, RetryPolicy(maxAttempts = 3, sleeper = {}), DriveUploader.CHUNK_GRANULARITY)
+        // The worker only ever sees the abstraction, so this test also covers the Drive
+        // adapter end to end: every mocked Drive response has to survive translation.
+        backends = StorageBackendProvider { DriveStorageBackend(client, uploader) }
         files = FakeLocalFiles(content, statA)
     }
 
@@ -119,7 +125,7 @@ class SyncWorkerTest {
                 appContext: Context,
                 workerClassName: String,
                 workerParameters: WorkerParameters
-            ): ListenableWorker = SyncWorker(appContext, workerParameters, repo, uploader, files) { _ -> null }
+            ): ListenableWorker = SyncWorker(appContext, workerParameters, repo, backends, files) { _ -> null }
         }
         return TestListenableWorkerBuilder<SyncWorker>(context).setWorkerFactory(factory).build() as SyncWorker
     }
@@ -265,7 +271,7 @@ class SyncWorkerTest {
         // is NOT_UPLOADED→QUEUED, but the ledger remembers these exact bytes on Drive.
         db.syncRecordDao().upsert(record(id = 7, md5 = contentMd5))
         db.uploadedContentDao().upsert(
-            com.goattidi.mediasync.data.db.UploadedContent(contentMd5, "drv-earlier", "old-name.mp4", 11, 123L)
+            com.goattidi.mediasync.data.db.UploadedContent("DRIVE", contentMd5, "drv-earlier", "old-name.mp4", 11, 123L)
         )
         server.enqueue(
             MockResponse().setResponseCode(200)
@@ -286,7 +292,7 @@ class SyncWorkerTest {
     fun `stale ledger entry pointing at deleted Drive file falls back to real upload`() = runTest {
         db.syncRecordDao().upsert(record(id = 8, md5 = contentMd5))
         db.uploadedContentDao().upsert(
-            com.goattidi.mediasync.data.db.UploadedContent(contentMd5, "drv-gone", "old.mp4", 11, 123L)
+            com.goattidi.mediasync.data.db.UploadedContent("DRIVE", contentMd5, "drv-gone", "old.mp4", 11, 123L)
         )
         server.enqueue(MockResponse().setResponseCode(404)) // ledger check: file deleted on Drive
         server.enqueue(sessionStart())
@@ -299,7 +305,7 @@ class SyncWorkerTest {
         assertEquals(SyncStatus.SYNCED, rec.status)
         assertEquals("drv-new", rec.driveFileId)
         // ledger now points at the fresh upload
-        assertEquals("drv-new", db.uploadedContentDao().getByMd5(contentMd5)!!.driveFileId)
+        assertEquals("drv-new", db.uploadedContentDao().getByChecksum("DRIVE", contentMd5)!!.driveFileId)
     }
 
     @Test

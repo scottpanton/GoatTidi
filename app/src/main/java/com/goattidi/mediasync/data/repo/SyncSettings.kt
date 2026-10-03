@@ -8,6 +8,8 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.goattidi.mediasync.data.storage.BackendId
+import com.goattidi.mediasync.data.storage.s3.S3Config
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -29,6 +31,24 @@ enum class DriveLayout {
     MIRROR_LOCAL
 }
 
+/**
+ * One backend's endpoint details, as the user typed them. Null fields mean unset, and an
+ * incomplete config is not usable — see [SyncSettings.s3Config].
+ */
+data class S3Settings(
+    val endpoint: String = "",
+    val region: String = "",
+    val bucket: String = "",
+    val accessKeyId: String = "",
+    val secretAccessKey: String = "",
+    val sessionToken: String = "",
+    val pathStyle: Boolean = true
+) {
+    val hasCredentials: Boolean get() = accessKeyId.isNotBlank() && secretAccessKey.isNotBlank()
+    val isComplete: Boolean
+        get() = endpoint.startsWith("http") && region.isNotBlank() && bucket.isNotBlank() && hasCredentials
+}
+
 @Singleton
 class SyncSettings @Inject constructor(
     @ApplicationContext private val context: Context
@@ -38,6 +58,56 @@ class SyncSettings @Inject constructor(
     private val keyFolderName = stringPreferencesKey("drive_folder_name")
     private val keyFolderId = stringPreferencesKey("drive_folder_id")
     private val keyLayout = stringPreferencesKey("drive_layout")
+
+    // ---- Selected storage backend ----
+
+    private val keyBackendId = stringPreferencesKey("storage_backend")
+
+    /**
+     * Which service uploads go to. Drive for every install that predates this setting and
+     * for anyone who never picks otherwise, so the upgrade changes nothing about where
+     * their files already are.
+     */
+    val backendId: Flow<BackendId> = context.dataStore.data.map { BackendId.parse(it[keyBackendId]) }
+
+    suspend fun setBackendId(value: BackendId) {
+        context.dataStore.edit { it[keyBackendId] = value.name }
+    }
+
+    private val keyS3Endpoint = stringPreferencesKey("s3_endpoint")
+    private val keyS3Region = stringPreferencesKey("s3_region")
+    private val keyS3Bucket = stringPreferencesKey("s3_bucket")
+    private val keyS3AccessKeyId = stringPreferencesKey("s3_access_key_id")
+    private val keyS3SecretAccessKey = stringPreferencesKey("s3_secret_access_key")
+    private val keyS3SessionToken = stringPreferencesKey("s3_session_token")
+    private val keyS3PathStyle = booleanPreferencesKey("s3_path_style")
+
+    val s3Settings: Flow<S3Settings> = context.dataStore.data.map { prefs ->
+        S3Settings(
+            endpoint = prefs[keyS3Endpoint].orEmpty(),
+            region = prefs[keyS3Region].orEmpty(),
+            bucket = prefs[keyS3Bucket].orEmpty(),
+            accessKeyId = prefs[keyS3AccessKeyId].orEmpty(),
+            secretAccessKey = prefs[keyS3SecretAccessKey].orEmpty(),
+            sessionToken = prefs[keyS3SessionToken].orEmpty(),
+            pathStyle = prefs[keyS3PathStyle] ?: true
+        )
+    }
+
+    suspend fun setS3Settings(value: S3Settings) {
+        context.dataStore.edit {
+            it[keyS3Endpoint] = value.endpoint.trim()
+            it[keyS3Region] = value.region.trim()
+            it[keyS3Bucket] = value.bucket.trim()
+            it[keyS3AccessKeyId] = value.accessKeyId.trim()
+            it[keyS3SecretAccessKey] = value.secretAccessKey.trim()
+            it[keyS3SessionToken] = value.sessionToken.trim()
+            it[keyS3PathStyle] = value.pathStyle
+            // The cached destination folder id is a Drive folder id; it cannot mean
+            // anything to S3, where the destination is a key prefix.
+            it.remove(keyFolderId)
+        }
+    }
 
     val wifiOnly: Flow<Boolean> = context.dataStore.data.map { it[keyWifiOnly] ?: true }
     val chargingOnly: Flow<Boolean> = context.dataStore.data.map { it[keyChargingOnly] ?: false }
@@ -95,6 +165,7 @@ class SyncSettings @Inject constructor(
         context.dataStore.edit { it[keyExternalRead] = value }
     }
 
+    
     private val keyLastSyncScan = longPreferencesKey("sync_search_scanned_at")
 
     /** When the sync-search folder was last indexed (epoch ms); 0 = never. */

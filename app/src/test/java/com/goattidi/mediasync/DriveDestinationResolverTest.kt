@@ -9,7 +9,7 @@ import com.goattidi.mediasync.data.db.SyncStatus
 import com.goattidi.mediasync.data.drive.DriveClient
 import com.goattidi.mediasync.data.repo.DriveLayout
 import com.goattidi.mediasync.data.repo.SyncSettings
-import com.goattidi.mediasync.sync.SettingsDriveFolderResolver
+import com.goattidi.mediasync.sync.DriveDestinationResolver
 import kotlinx.coroutines.test.runTest
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
@@ -25,11 +25,11 @@ import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34], application = Application::class)
-class DriveFolderResolverTest {
+class DriveDestinationResolverTest {
 
     private lateinit var settings: SyncSettings
     private lateinit var server: MockWebServer
-    private lateinit var resolver: SettingsDriveFolderResolver
+    private lateinit var resolver: DriveDestinationResolver
 
     @Before
     fun setUp() {
@@ -38,7 +38,7 @@ class DriveFolderResolverTest {
         server = MockWebServer()
         server.start()
         val client = DriveClient(FakeDriveAuth(), OkHttpClient(), server.url("/").toString())
-        resolver = SettingsDriveFolderResolver(settings, client)
+        resolver = DriveDestinationResolver(settings, client)
     }
 
     @After
@@ -77,7 +77,7 @@ class DriveFolderResolverTest {
         server.enqueue(folderMissing())
         server.enqueue(folderCreated("root-flat"))
 
-        val id = resolver.resolveFolderId(record("/dcim/Camera/a.jpg"))
+        val id = resolver.resolveDestinationId(record("/dcim/Camera/a.jpg"))
 
         assertEquals("root-flat", id)
         assertEquals(2, server.requestCount)
@@ -91,18 +91,18 @@ class DriveFolderResolverTest {
         server.enqueue(folderMissing())            // "Camera" child missing
         server.enqueue(folderCreated("child-camera"))
 
-        val first = resolver.resolveFolderId(record("/dcim/Camera/a.jpg"))
+        val first = resolver.resolveDestinationId(record("/dcim/Camera/a.jpg"))
         assertEquals("child-camera", first)
         assertEquals(3, server.requestCount)
 
         // Same source folder again: fully served from cache, zero requests
-        val second = resolver.resolveFolderId(record("/dcim/Camera/b.jpg"))
+        val second = resolver.resolveDestinationId(record("/dcim/Camera/b.jpg"))
         assertEquals("child-camera", second)
         assertEquals(3, server.requestCount)
 
         // Different source folder: only the child lookup hits the network
         server.enqueue(folderFound("child-whatsapp"))
-        val third = resolver.resolveFolderId(record("/WhatsApp/Media/WhatsApp Video/c.mp4"))
+        val third = resolver.resolveDestinationId(record("/WhatsApp/Media/WhatsApp Video/c.mp4"))
         assertEquals("child-whatsapp", third)
         assertEquals(4, server.requestCount)
     }
@@ -116,7 +116,7 @@ class DriveFolderResolverTest {
         server.enqueue(folderMissing())
         server.enqueue(folderCreated("root-new"))
 
-        val id = resolver.resolveFolderId(record("/dcim/Camera/a.jpg"))
+        val id = resolver.resolveDestinationId(record("/dcim/Camera/a.jpg"))
 
         assertEquals("root-new", id)
         assertEquals("root-new", settings.cachedFolderId())
@@ -136,7 +136,7 @@ class DriveFolderResolverTest {
         server.enqueue(folderMissing())
         server.enqueue(folderCreated("root-fresh"))
 
-        assertEquals("root-fresh", resolver.resolveFolderId(record("/dcim/Camera/a.jpg")))
+        assertEquals("root-fresh", resolver.resolveDestinationId(record("/dcim/Camera/a.jpg")))
         assertEquals("root-fresh", settings.cachedFolderId())
     }
 
@@ -151,8 +151,8 @@ class DriveFolderResolverTest {
             )
         )
 
-        assertEquals("root-live", resolver.resolveFolderId(record("/dcim/Camera/a.jpg")))
-        assertEquals("root-live", resolver.resolveFolderId(record("/dcim/Camera/b.jpg")))
+        assertEquals("root-live", resolver.resolveDestinationId(record("/dcim/Camera/a.jpg")))
+        assertEquals("root-live", resolver.resolveDestinationId(record("/dcim/Camera/b.jpg")))
         assertEquals(1, server.requestCount)
     }
 
@@ -165,7 +165,7 @@ class DriveFolderResolverTest {
         server.enqueue(folderMissing())
         server.enqueue(folderCreated("child-month"))
 
-        val id = resolver.resolveFolderId(record("/dcim/Camera/a.jpg"))
+        val id = resolver.resolveDestinationId(record("/dcim/Camera/a.jpg"))
 
         assertEquals("child-month", id)
         server.takeRequest() // root lookup

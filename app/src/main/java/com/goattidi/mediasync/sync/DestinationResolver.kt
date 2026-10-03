@@ -14,9 +14,12 @@ import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 
-/** Supplies the Drive folder id a given upload should land in (null = Drive root). */
-fun interface DriveFolderResolver {
-    suspend fun resolveFolderId(record: SyncRecord): String?
+/**
+ * Supplies the destination a given upload should land in, as an id only the active backend
+ * interprets: a Drive folder id, or an S3 key prefix. Null means the backend root.
+ */
+fun interface DestinationResolver {
+    suspend fun resolveDestinationId(record: SyncRecord): String?
 }
 
 /**
@@ -27,10 +30,10 @@ fun interface DriveFolderResolver {
  * separate from folders other tools manage (§4.4).
  */
 @Singleton
-class SettingsDriveFolderResolver @Inject constructor(
+class DriveDestinationResolver @Inject constructor(
     private val settings: SyncSettings,
     private val client: DriveClient
-) : DriveFolderResolver {
+) : DestinationResolver {
 
     private val childCache = ConcurrentHashMap<String, String>()
 
@@ -41,7 +44,7 @@ class SettingsDriveFolderResolver @Inject constructor(
     @Volatile
     private var confirmedRootId: String? = null
 
-    override suspend fun resolveFolderId(record: SyncRecord): String? {
+    override suspend fun resolveDestinationId(record: SyncRecord): String? {
         val rootId = rootFolderId()
         val childName = when (settings.layout.first()) {
             DriveLayout.FLAT -> return rootId

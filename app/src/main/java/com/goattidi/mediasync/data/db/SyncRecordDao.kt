@@ -26,8 +26,24 @@ interface SyncRecordDao {
     @Query("SELECT * FROM sync_records WHERE status = :status")
     suspend fun getByStatus(status: SyncStatus): List<SyncRecord>
 
+    /** Rows that name a remote object, for whichever backend issued it. */
     @Query("SELECT * FROM sync_records WHERE driveFileId IS NOT NULL")
-    suspend fun getAllWithDriveFile(): List<SyncRecord>
+    suspend fun getAllWithRemoteObject(): List<SyncRecord>
+
+    /**
+     * Rows in [status] whose remote object was issued by [backendId] — how a verify or a
+     * reclaim pass stays on the backend the user actually selected.
+     */
+    @Query("SELECT * FROM sync_records WHERE status = :status AND driveFileId IS NOT NULL AND backendId = :backendId")
+    suspend fun getByStatusWithRemoteObject(status: SyncStatus, backendId: String): List<SyncRecord>
+
+    /** Drops in-flight state that belongs to another backend, keeping the local record. */
+    @Query(
+        "UPDATE sync_records SET resumeSessionUri = NULL, driveFileId = NULL, driveMd5 = NULL, " +
+            "uploadedAt = NULL, bytesUploaded = 0, uploadRateBps = 0 " +
+            "WHERE driveFileId IS NOT NULL AND (backendId IS NULL OR backendId != :backendId)"
+    )
+    suspend fun clearRemoteStateForOtherBackends(backendId: String): Int
 
     @Query("DELETE FROM sync_records WHERE mediaStoreId IN (:ids)")
     suspend fun deleteByIds(ids: List<Long>)

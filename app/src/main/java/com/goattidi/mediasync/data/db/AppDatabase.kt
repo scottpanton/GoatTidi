@@ -23,7 +23,7 @@ class Converters {
 
 @Database(
     entities = [SyncRecord::class, UploadedContent::class],
-    version = 4,
+    version = 5,
     exportSchema = false
 )
 @TypeConverters(Converters::class)
@@ -59,6 +59,41 @@ abstract class AppDatabase : RoomDatabase() {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE sync_records ADD COLUMN bytesUploaded INTEGER NOT NULL DEFAULT 0")
                 db.execSQL("ALTER TABLE sync_records ADD COLUMN uploadRateBps INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        /**
+         * v5: records which backend issued each remote object id, so the same row can hold
+         * a Drive file id and an S3 key without either being read against the wrong service.
+         *
+         * Existing rows are left null, which reads as Drive — the only backend that
+         * existed — so no synced record is invalidated by the upgrade.
+         *
+         * The ledger's key becomes (backendId, md5) so both backends can hold an entry for
+         * the same bytes. Changing a primary key means rebuilding the table, which is also
+         * the opportunity to hand it the id column the other one already uses.
+         */
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE sync_records ADD COLUMN backendId TEXT")
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `uploaded_content_new` (" +
+                        "`backendId` TEXT NOT NULL, " +
+                        "`md5` TEXT NOT NULL, " +
+                        "`driveFileId` TEXT NOT NULL, " +
+                        "`fileName` TEXT NOT NULL, " +
+                        "`sizeBytes` INTEGER NOT NULL, " +
+                        "`uploadedAt` INTEGER NOT NULL, " +
+                        "PRIMARY KEY(`backendId`, `md5`))"
+                )
+                db.execSQL(
+                    "INSERT INTO `uploaded_content_new` " +
+                        "(`backendId`, `md5`, `driveFileId`, `fileName`, `sizeBytes`, `uploadedAt`) " +
+                        "SELECT 'DRIVE', `md5`, `driveFileId`, `fileName`, `sizeBytes`, `uploadedAt` " +
+                        "FROM `uploaded_content`"
+                )
+                db.execSQL("DROP TABLE `uploaded_content`")
+                db.execSQL("ALTER TABLE `uploaded_content_new` RENAME TO `uploaded_content`")
             }
         }
     }

@@ -2,12 +2,12 @@ package com.goattidi.mediasync.sync
 
 import com.goattidi.mediasync.data.db.SyncRecord
 import com.goattidi.mediasync.data.db.SyncStatus
-import com.goattidi.mediasync.data.drive.DriveClient
-import com.goattidi.mediasync.data.drive.DriveException
 import com.goattidi.mediasync.data.drive.RetryPolicy
-import com.goattidi.mediasync.data.drive.withRetry
 import com.goattidi.mediasync.data.hash.Md5
 import com.goattidi.mediasync.data.repo.SyncStateRepository
+import com.goattidi.mediasync.data.storage.StorageBackendProvider
+import com.goattidi.mediasync.data.storage.StorageException
+import com.goattidi.mediasync.data.storage.withStorageRetry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import javax.inject.Inject
@@ -18,13 +18,14 @@ import javax.inject.Singleton
  * through MediaStore.createDeleteRequest on API 30+); this engine owns the gate:
  *
  * Invariant #3 — a local file may only be deleted when a FRESH check proves its
- * current bytes are on Drive: freshly recomputed local MD5 == freshly fetched Drive
- * MD5. A stale `status == SYNCED` is never sufficient.
+ * current bytes are in storage: a freshly computed local MD5 equal to the checksum
+ * the backend reports for the stored object. A stale `status == SYNCED` is never
+ * sufficient.
  */
 @Singleton
 class ReclaimEngine @Inject constructor(
     private val repository: SyncStateRepository,
-    private val client: DriveClient,
+    private val router: StorageBackendProvider,
     private val localFiles: LocalFiles
 ) {
     sealed class Gate {
@@ -53,25 +54,35 @@ class ReclaimEngine @Inject constructor(
             return Gate.Blocked("Local file is already gone")
         }
 
-        // Fresh remote check: the Drive copy must still exist with a checksum
+        val backend = router.backend()
+        // Only the backend that issued the object can say whether it is still there; an id
+        // from the other one would describe nothing.
+        if (!record.belongsTo(backend.id.name)) {
+            return Gate.Blocked("File was not uploaded to ${backend.displayName}")
+        }
+
+        // Fresh remote check: the stored copy must still exist with a checksum
         val remote = try {
-            withRetry(retryPolicy) { client.getFile(record.driveFileId) }
-        } catch (e: DriveException.NotFound) {
+            withStorageRetry(retryPolicy) { backend.stat(record.driveFileId) }
+        } catch (e: StorageException.NotFound) {
             repository.markOrphaned(mediaStoreId)
-            return Gate.Blocked("File no longer exists on Drive")
+            return Gate.Blocked("File no longer exists in ${backend.displayName}")
         }
         if (remote.trashed) {
             repository.markOrphaned(mediaStoreId)
-            return Gate.Blocked("Drive copy is in the trash")
+            return Gate.Blocked("${backend.displayName} copy is in the trash")
         }
-        val remoteMd5 = remote.md5Checksum
-            ?: return Gate.Blocked("Drive has not produced a checksum for this file")
+        val remoteChecksum = remote.checksum
+            ?: return Gate.Blocked("${backend.displayName} has not produced a checksum for this file")
 
         // Fresh local check: hash the bytes as they are RIGHT NOW, not the cached value
         val freshLocalMd5 = Md5.of(localFiles.open(record, 0))
-        if (!freshLocalMd5.equals(remoteMd5, ignoreCase = true)) {
+        val expected = backend.expectedLocalChecksum(record) ?: freshLocalMd5
+        if (!freshLocalMd5.equals(expected, ignoreCase = true) ||
+            !expected.equals(remoteChecksum, ignoreCase = true)
+        ) {
             repository.markModifiedSinceUpload(mediaStoreId)
-            return Gate.Blocked("Local file was modified since upload — current bytes are not on Drive")
+            return Gate.Blocked("Local file was modified since upload — current bytes are not stored")
         }
         return Gate.Safe
     }

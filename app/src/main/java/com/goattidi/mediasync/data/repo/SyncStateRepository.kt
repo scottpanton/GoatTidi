@@ -81,32 +81,53 @@ class SyncStateRepository @Inject constructor(
     suspend fun saveSessionUri(id: Long, sessionUri: String) =
         update(id) { it.copy(resumeSessionUri = sessionUri) }
 
-    suspend fun markSynced(id: Long, driveFileId: String, driveMd5: String, uploadedAt: Long) {
+    suspend fun markSynced(
+        id: Long,
+        backendId: String,
+        driveFileId: String,
+        driveMd5: String,
+        uploadedAt: Long
+    ) {
         update(id) {
             it.copy(
-                status = SyncStatus.SYNCED, driveFileId = driveFileId, driveMd5 = driveMd5,
-                uploadedAt = uploadedAt, resumeSessionUri = null, failureReason = null,
-                bytesUploaded = 0, uploadRateBps = 0
+                status = SyncStatus.SYNCED, backendId = backendId, driveFileId = driveFileId,
+                driveMd5 = driveMd5, uploadedAt = uploadedAt, resumeSessionUri = null,
+                failureReason = null, bytesUploaded = 0, uploadRateBps = 0
             )
         }
         dao.getById(id)?.let { r ->
             uploadedDao.upsert(
-                UploadedContent(driveMd5.lowercase(), driveFileId, r.fileName, r.sizeBytes, uploadedAt)
+                UploadedContent(
+                    backendId, driveMd5.lowercase(), driveFileId, r.fileName, r.sizeBytes, uploadedAt
+                )
             )
         }
     }
 
     // ---- Upload ledger (content dedup, §4.4) ----
 
-    suspend fun lookupUploaded(md5: String): UploadedContent? = uploadedDao.getByMd5(md5.lowercase())
+    suspend fun lookupUploaded(backendId: String, md5: String): UploadedContent? =
+        uploadedDao.getByChecksum(backendId, md5.lowercase())
 
-    suspend fun forgetUploaded(md5: String) = uploadedDao.deleteByMd5(md5.lowercase())
+    suspend fun forgetUploaded(backendId: String, md5: String) =
+        uploadedDao.deleteByChecksum(backendId, md5.lowercase())
 
-    /** Empty after a fresh install or cleared app data — the ledger must be rebuilt from Drive. */
-    suspend fun ledgerIsEmpty(): Boolean = uploadedDao.count() == 0
+    /**
+     * Whether [backendId] has no ledger at all — a fresh install, cleared app data, or a
+     * backend the user has just switched to. It then has to be rebuilt by scanning.
+     */
+    suspend fun ledgerIsEmpty(backendId: String): Boolean = uploadedDao.count(backendId) == 0
 
-    suspend fun recordUploaded(md5: String, driveFileId: String, fileName: String, sizeBytes: Long, uploadedAt: Long) =
-        uploadedDao.upsert(UploadedContent(md5.lowercase(), driveFileId, fileName, sizeBytes, uploadedAt))
+    suspend fun recordUploaded(
+        backendId: String,
+        md5: String,
+        driveFileId: String,
+        fileName: String,
+        sizeBytes: Long,
+        uploadedAt: Long
+    ) = uploadedDao.upsert(
+        UploadedContent(backendId, md5.lowercase(), driveFileId, fileName, sizeBytes, uploadedAt)
+    )
 
     suspend fun markFailed(id: Long, reason: String, driveFileId: String? = null) =
         update(id) {
@@ -118,8 +139,8 @@ class SyncStateRepository @Inject constructor(
         }
 
     /** Upload finished but Drive hasn't produced a checksum yet: keep UPLOADING, drop the session. */
-    suspend fun markUnverified(id: Long, driveFileId: String) =
-        update(id) { it.copy(driveFileId = driveFileId, resumeSessionUri = null) }
+    suspend fun markUnverified(id: Long, backendId: String, driveFileId: String) =
+        update(id) { it.copy(backendId = backendId, driveFileId = driveFileId, resumeSessionUri = null) }
 
     /** Puts an item back in the queue (retryable failure); keeps the resumable session. */
     suspend fun requeue(id: Long, reason: String? = null) =
@@ -137,7 +158,22 @@ class SyncStateRepository @Inject constructor(
 
     // ---- Verify / reclaim support ----
 
-    suspend fun recordsWithDriveFile(): List<SyncRecord> = dao.getAllWithDriveFile()
+    /**
+     * Records that name a remote object in [backendId]. Rows whose object belongs to the
+     * other backend are excluded rather than re-checked there, since the id would mean
+     * nothing to the service being asked.
+     */
+    suspend fun recordsWithRemoteObject(backendId: String): List<SyncRecord> =
+        dao.getAllWithRemoteObject().filter { it.belongsTo(backendId) }
+
+    /**
+     * Forgets remote state that a different backend issued, keeping every local record.
+     * Called when the user switches backend, so a stale Drive file id is never offered to
+     * S3 or the other way round — the bytes still have to be sent to the new backend, but
+     * the record must stop claiming they are already there.
+     */
+    suspend fun clearRemoteStateForOtherBackends(backendId: String): Int =
+        dao.clearRemoteStateForOtherBackends(backendId)
 
     suspend fun syncedRecords(): List<SyncRecord> = dao.getByStatus(SyncStatus.SYNCED)
 
@@ -154,10 +190,10 @@ class SyncStateRepository @Inject constructor(
             )
         }
 
-    suspend fun confirmSynced(id: Long, driveMd5: String) {
+    suspend fun confirmSynced(id: Long, backendId: String, driveMd5: String) {
         update(id) {
             it.copy(
-                status = SyncStatus.SYNCED, driveMd5 = driveMd5,
+                status = SyncStatus.SYNCED, backendId = backendId, driveMd5 = driveMd5,
                 uploadedAt = it.uploadedAt ?: System.currentTimeMillis(), failureReason = null
             )
         }
@@ -165,7 +201,7 @@ class SyncStateRepository @Inject constructor(
             val fileId = r.driveFileId ?: return
             uploadedDao.upsert(
                 UploadedContent(
-                    driveMd5.lowercase(), fileId, r.fileName, r.sizeBytes,
+                    backendId, driveMd5.lowercase(), fileId, r.fileName, r.sizeBytes,
                     r.uploadedAt ?: System.currentTimeMillis()
                 )
             )
@@ -190,6 +226,7 @@ class SyncStateRepository @Inject constructor(
         localMd5 = null,
         md5SizeBytes = null,
         md5DateModified = null,
+        backendId = null,
         driveFileId = null,
         driveMd5 = null,
         uploadedAt = null,

@@ -2,10 +2,12 @@ package com.goattidi.mediasync.di
 
 import com.goattidi.mediasync.data.drive.DriveAuthProvider
 import com.goattidi.mediasync.data.drive.GoogleDriveAuthProvider
-import com.goattidi.mediasync.sync.DriveFolderResolver
+import com.goattidi.mediasync.data.storage.StorageBackendProvider
+import com.goattidi.mediasync.data.storage.StorageRouter
+import com.goattidi.mediasync.sync.DestinationResolver
 import com.goattidi.mediasync.sync.LocalFiles
 import com.goattidi.mediasync.sync.MediaStoreLocalFiles
-import com.goattidi.mediasync.sync.SettingsDriveFolderResolver
+import com.goattidi.mediasync.sync.RoutedDestinationResolver
 import dagger.Binds
 import dagger.Module
 import dagger.hilt.InstallIn
@@ -24,5 +26,9 @@ abstract class BindsModule {
     abstract fun bindLocalFiles(impl: MediaStoreLocalFiles): LocalFiles
 
     @Binds
-    abstract fun bindDriveFolderResolver(impl: SettingsDriveFolderResolver): DriveFolderResolver
+    abstract fun bindDestinationResolver(impl: RoutedDestinationResolver): DestinationResolver
+
+    @Binds
+    @Singleton
+    abstract fun bindStorageBackendProvider(impl: StorageRouter): StorageBackendProvider
 }

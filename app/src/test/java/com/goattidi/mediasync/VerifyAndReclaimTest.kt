@@ -9,7 +9,10 @@ import com.goattidi.mediasync.data.db.MediaType
 import com.goattidi.mediasync.data.db.SyncRecord
 import com.goattidi.mediasync.data.db.SyncStatus
 import com.goattidi.mediasync.data.drive.DriveClient
+import com.goattidi.mediasync.data.drive.DriveUploader
 import com.goattidi.mediasync.data.drive.RetryPolicy
+import com.goattidi.mediasync.data.storage.DriveStorageBackend
+import com.goattidi.mediasync.data.storage.StorageBackendProvider
 import com.goattidi.mediasync.data.hash.Md5
 import com.goattidi.mediasync.data.media.MediaStoreScanner
 import com.goattidi.mediasync.data.repo.SyncStateRepository
@@ -39,6 +42,13 @@ class VerifyAndReclaimTest {
     private lateinit var repo: SyncStateRepository
     private lateinit var server: MockWebServer
     private lateinit var client: DriveClient
+
+    /**
+     * Drives the engines through the Drive adapter, which is how this file doubles as the
+     * regression test for the adapter: every mock Drive response below now has to survive
+     * being translated into a StorageBackend call.
+     */
+    private fun driveBackends() = StorageBackendProvider { DriveStorageBackend(client, DriveUploader(client)) }
 
     private val content = "hello world".toByteArray()
     private val contentMd5 = "5eb63bbbe01eeed093cb22bb8f5acdc3"
@@ -109,7 +119,7 @@ class VerifyAndReclaimTest {
         seed(1, SyncStatus.SYNCED)
         server.enqueue(MockResponse().setResponseCode(404))
 
-        val summary = VerifyEngine(repo, client).verifyAll(policy)
+        val summary = VerifyEngine(repo, driveBackends()).verifyAll(policy)
 
         assertEquals(1, summary.orphaned)
         assertEquals(SyncStatus.ORPHANED, db.syncRecordDao().getById(1)!!.status)
@@ -123,7 +133,7 @@ class VerifyAndReclaimTest {
                 .setBody("""{"id":"drv-1","md5Checksum":"$contentMd5","trashed":true}""")
         )
 
-        VerifyEngine(repo, client).verifyAll(policy)
+        VerifyEngine(repo, driveBackends()).verifyAll(policy)
 
         assertEquals(SyncStatus.ORPHANED, db.syncRecordDao().getById(1)!!.status)
     }
@@ -136,7 +146,7 @@ class VerifyAndReclaimTest {
                 .setBody("""{"id":"drv-1","md5Checksum":"$contentMd5"}""")
         )
 
-        val summary = VerifyEngine(repo, client).verifyAll(policy)
+        val summary = VerifyEngine(repo, driveBackends()).verifyAll(policy)
 
         assertEquals(1, summary.confirmedSynced)
         val rec = db.syncRecordDao().getById(1)!!
@@ -152,7 +162,7 @@ class VerifyAndReclaimTest {
                 .setBody("""{"id":"drv-1","md5Checksum":"ffffffffffffffffffffffffffffffff"}""")
         )
 
-        val summary = VerifyEngine(repo, client).verifyAll(policy)
+        val summary = VerifyEngine(repo, driveBackends()).verifyAll(policy)
 
         assertEquals(1, summary.modified)
         assertEquals(SyncStatus.MODIFIED_SINCE_UPLOAD, db.syncRecordDao().getById(1)!!.status)
@@ -163,7 +173,7 @@ class VerifyAndReclaimTest {
         seed(1, SyncStatus.UPLOADING, driveMd5 = null)
         server.enqueue(MockResponse().setResponseCode(200).setBody("""{"id":"drv-1"}"""))
 
-        val summary = VerifyEngine(repo, client).verifyAll(policy)
+        val summary = VerifyEngine(repo, driveBackends()).verifyAll(policy)
 
         assertEquals(1, summary.stillUnverified)
         assertEquals(SyncStatus.UPLOADING, db.syncRecordDao().getById(1)!!.status)
@@ -178,7 +188,7 @@ class VerifyAndReclaimTest {
             MockResponse().setResponseCode(200)
                 .setBody("""{"id":"drv-1","md5Checksum":"$contentMd5"}""")
         )
-        val engine = ReclaimEngine(repo, client, StaticLocalFiles(content, stat))
+        val engine = ReclaimEngine(repo, driveBackends(), StaticLocalFiles(content, stat))
 
         val gate = engine.confirmSafeToDelete(1, policy)
 
@@ -193,7 +203,7 @@ class VerifyAndReclaimTest {
                 .setBody("""{"id":"drv-1","md5Checksum":"$contentMd5"}""")
         )
         // ...but the actual bytes on disk are different now
-        val engine = ReclaimEngine(repo, client, StaticLocalFiles("tampered!!".toByteArray(), stat))
+        val engine = ReclaimEngine(repo, driveBackends(), StaticLocalFiles("tampered!!".toByteArray(), stat))
 
         val gate = engine.confirmSafeToDelete(1, policy)
 
@@ -205,7 +215,7 @@ class VerifyAndReclaimTest {
     fun `delete blocked when Drive copy is gone`() = runTest {
         seed(1, SyncStatus.SYNCED)
         server.enqueue(MockResponse().setResponseCode(404))
-        val engine = ReclaimEngine(repo, client, StaticLocalFiles(content, stat))
+        val engine = ReclaimEngine(repo, driveBackends(), StaticLocalFiles(content, stat))
 
         val gate = engine.confirmSafeToDelete(1, policy)
 
@@ -216,7 +226,7 @@ class VerifyAndReclaimTest {
     @Test
     fun `delete blocked for non-synced statuses without any network call`() = runTest {
         seed(1, SyncStatus.MODIFIED_SINCE_UPLOAD)
-        val engine = ReclaimEngine(repo, client, StaticLocalFiles(content, stat))
+        val engine = ReclaimEngine(repo, driveBackends(), StaticLocalFiles(content, stat))
 
         val gate = engine.confirmSafeToDelete(1, policy)
 
@@ -229,7 +239,7 @@ class VerifyAndReclaimTest {
         seed(1, SyncStatus.SYNCED)
         db.syncRecordDao().upsert(seed(2, SyncStatus.SYNCED).copy(sizeBytes = 999_999))
         seed(3, SyncStatus.NOT_UPLOADED)
-        val engine = ReclaimEngine(repo, client, StaticLocalFiles(content, stat))
+        val engine = ReclaimEngine(repo, driveBackends(), StaticLocalFiles(content, stat))
 
         val candidates = engine.candidates()
 
@@ -252,11 +262,11 @@ class VerifyAndReclaimTest {
             )
         )
 
-        val imported = VerifyEngine(repo, client).importLedgerFromDrive(policy)
+        val imported = VerifyEngine(repo, driveBackends()).importLedger(policy)
 
         assertEquals(2, imported) // the checksum-less file is skipped
-        assertEquals("f1", db.uploadedContentDao().getByMd5("aaaa")!!.driveFileId)
-        assertEquals("f3", db.uploadedContentDao().getByMd5("bbbb")!!.driveFileId) // case-normalized
+        assertEquals("f1", db.uploadedContentDao().getByChecksum("DRIVE", "aaaa")!!.driveFileId)
+        assertEquals("f3", db.uploadedContentDao().getByChecksum("DRIVE", "bbbb")!!.driveFileId) // case-normalized
         assertEquals(2, server.requestCount)
         assertTrue(server.takeRequest().path!!.contains("fields=nextPageToken"))
         assertTrue(server.takeRequest().path!!.contains("pageToken=page2"))
@@ -275,11 +285,11 @@ class VerifyAndReclaimTest {
             )
         )
 
-        val imported = VerifyEngine(repo, client).importLedgerFromDrive(policy)
+        val imported = VerifyEngine(repo, driveBackends()).importLedger(policy)
 
         assertEquals(1, imported)
-        assertEquals("mine", db.uploadedContentDao().getByMd5("aaaa")!!.driveFileId)
-        assertEquals(null, db.uploadedContentDao().getByMd5("cccc"))
+        assertEquals("mine", db.uploadedContentDao().getByChecksum("DRIVE", "aaaa")!!.driveFileId)
+        assertEquals(null, db.uploadedContentDao().getByChecksum("DRIVE", "cccc"))
     }
 
     @Test
@@ -318,16 +328,16 @@ class VerifyAndReclaimTest {
             )
         )
 
-        val result = VerifyEngine(repo, client).scanOwnUploadsAndFolder("ext-root", policy)
+        val result = VerifyEngine(repo, driveBackends()).scanOwnUploadsAndContainer("ext-root", policy)
 
-        assertEquals(VerifyEngine.SyncScanResult(own = 1, inFolder = 3), result)
+        assertEquals(VerifyEngine.SyncScanResult(own = 1, inContainer = 3), result)
         val ledger = db.uploadedContentDao()
         listOf("c1" to "v1", "c2" to "v2", "c5" to "v3", "c4" to "own1").forEach { (md5, id) ->
-            assertEquals(id, ledger.getByMd5(md5)!!.driveFileId)
+            assertEquals(id, ledger.getByChecksum("DRIVE", md5)!!.driveFileId)
         }
-        assertEquals(null, ledger.getByMd5("c3")) // outside the tree and not the app's own
-        assertEquals(null, ledger.getByMd5("c6")) // in a parent loop outside the tree
-        assertEquals(null, ledger.getByMd5("c7")) // in the tree, but someone else's file
+        assertEquals(null, ledger.getByChecksum("DRIVE", "c3")) // outside the tree and not the app's own
+        assertEquals(null, ledger.getByChecksum("DRIVE", "c6")) // in a parent loop outside the tree
+        assertEquals(null, ledger.getByChecksum("DRIVE", "c7")) // in the tree, but someone else's file
         assertEquals(4, server.requestCount) // folder check + one folder listing + two file pages
         server.takeRequest()
         server.takeRequest()
@@ -343,10 +353,10 @@ class VerifyAndReclaimTest {
             )
         )
 
-        val result = VerifyEngine(repo, client).scanOwnUploadsAndFolder("gone", policy)
+        val result = VerifyEngine(repo, driveBackends()).scanOwnUploadsAndContainer("gone", policy)
 
-        assertEquals(VerifyEngine.SyncScanResult(own = 1, inFolder = null), result)
-        assertEquals("own1", db.uploadedContentDao().getByMd5("c4")!!.driveFileId)
+        assertEquals(VerifyEngine.SyncScanResult(own = 1, inContainer = null), result)
+        assertEquals("own1", db.uploadedContentDao().getByChecksum("DRIVE", "c4")!!.driveFileId)
     }
 
     @Test
@@ -365,11 +375,11 @@ class VerifyAndReclaimTest {
             )
         )
 
-        val imported = VerifyEngine(repo, client).importEntireDrive(policy)
+        val imported = VerifyEngine(repo, driveBackends()).importEverything(policy)
 
         assertEquals(2, imported) // the checksum-less Doc is skipped
-        assertEquals("d1", db.uploadedContentDao().getByMd5("1111")!!.driveFileId)
-        assertEquals("d3", db.uploadedContentDao().getByMd5("2222")!!.driveFileId)
+        assertEquals("d1", db.uploadedContentDao().getByChecksum("DRIVE", "1111")!!.driveFileId)
+        assertEquals("d3", db.uploadedContentDao().getByChecksum("DRIVE", "2222")!!.driveFileId)
         assertEquals(2, server.requestCount) // no folder validation, no per-folder walk
         val first = java.net.URLDecoder.decode(server.takeRequest().path!!, "UTF-8")
         assertTrue(first.contains("'me' in owners")) // files merely shared with the user are excluded

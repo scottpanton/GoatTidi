@@ -14,10 +14,12 @@ import androidx.work.workDataOf
 import com.goattidi.mediasync.data.db.SyncRecord
 import com.goattidi.mediasync.data.db.SyncStatus
 import com.goattidi.mediasync.data.drive.DriveAuthConsentRequired
-import com.goattidi.mediasync.data.drive.DriveException
-import com.goattidi.mediasync.data.drive.DriveUploader
 import com.goattidi.mediasync.data.hash.Md5
 import com.goattidi.mediasync.data.repo.SyncStateRepository
+import com.goattidi.mediasync.data.storage.BackendId
+import com.goattidi.mediasync.data.storage.StorageBackend
+import com.goattidi.mediasync.data.storage.StorageException
+import com.goattidi.mediasync.data.storage.StorageBackendProvider
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
 import kotlinx.coroutines.coroutineScope
@@ -38,9 +40,9 @@ class SyncWorker @AssistedInject constructor(
     @Assisted appContext: Context,
     @Assisted workerParams: WorkerParameters,
     private val repository: SyncStateRepository,
-    private val uploader: DriveUploader,
+    private val router: StorageBackendProvider,
     private val localFiles: LocalFiles,
-    private val folderResolver: DriveFolderResolver
+    private val destinationResolver: DestinationResolver
 ) : CoroutineWorker(appContext, workerParams) {
 
     private enum class ItemResult { DONE, RETRY, ABORT }
@@ -48,9 +50,12 @@ class SyncWorker @AssistedInject constructor(
     override suspend fun doWork(): Result {
         // Foreground promotion can fail in tests / restricted states; upload anyway
         runCatching { setForeground(getForegroundInfo()) }
+        // Resolved once per run: the user's choice does not change mid-drain, and reading
+        // settings per item would be wasted work on a long queue.
+        val backend = router.backend()
         var retry = false
         for (record in repository.uploadBatch()) {
-            when (processOne(record)) {
+            when (processOne(record, backend)) {
                 ItemResult.DONE -> {}
                 ItemResult.RETRY -> retry = true
                 ItemResult.ABORT -> return Result.retry()
@@ -59,7 +64,7 @@ class SyncWorker @AssistedInject constructor(
         return if (retry) Result.retry() else Result.success()
     }
 
-    private suspend fun processOne(stale: SyncRecord): ItemResult {
+    private suspend fun processOne(stale: SyncRecord, backend: StorageBackend): ItemResult {
         // Re-read: the user may have canceled this item since the batch was fetched
         val record = repository.getById(stale.mediaStoreId) ?: return ItemResult.DONE
         if (record.status != SyncStatus.QUEUED && record.status != SyncStatus.UPLOADING) {
@@ -78,89 +83,105 @@ class SyncWorker @AssistedInject constructor(
             repository.markFailed(record.mediaStoreId, "File kept changing while computing checksum")
             return ItemResult.DONE
         }
-        val (md5, md5Stat) = prepared
+        val (_, md5Stat) = prepared
+        // Re-read so the cached MD5 is the one just verified above. Without this the
+        // checksum handed to the backend would be derived from a stale copy of the record.
+        val current = repository.getById(record.mediaStoreId) ?: return ItemResult.DONE
+        val md5 = current.localMd5 ?: return ItemResult.RETRY
+        // What the stored bytes must report back. Drive answers from the cached MD5; a
+        // backend whose checksum depends on how the file was chunked for upload derives it.
+        val expectedChecksum = backend.expectedLocalChecksum(current) ?: md5
 
+        val backendName = backend.displayName
         val outcome = try {
-            runUpload(record, md5, md5Stat)
-        } catch (e: DriveException.StorageQuotaExceeded) {
-            repository.requeue(record.mediaStoreId, "Google Drive storage is full")
+            runUpload(record, backend, expectedChecksum, md5Stat)
+        } catch (e: StorageException.StorageQuotaExceeded) {
+            repository.requeue(current.mediaStoreId, "$backendName storage is full")
             return ItemResult.ABORT
-        } catch (e: DriveException.AuthFailed) {
-            repository.requeue(record.mediaStoreId, "Google Drive sign-in expired — reconnect in the app")
+        } catch (e: StorageException.AuthFailed) {
+            repository.requeue(current.mediaStoreId, "$backendName rejected the credentials — check Settings")
             return ItemResult.ABORT
         } catch (e: DriveAuthConsentRequired) {
-            repository.requeue(record.mediaStoreId, "Google Drive authorization required")
+            repository.requeue(current.mediaStoreId, "Google Drive authorization required")
             return ItemResult.ABORT
-        } catch (e: DriveException.RateLimited) {
-            repository.requeue(record.mediaStoreId)
+        } catch (e: StorageException.RateLimited) {
+            repository.requeue(current.mediaStoreId)
             return ItemResult.RETRY
-        } catch (e: DriveException.Network) {
-            repository.requeue(record.mediaStoreId)
+        } catch (e: StorageException.Network) {
+            repository.requeue(current.mediaStoreId)
             return ItemResult.RETRY
-        } catch (e: DriveException) {
-            repository.markFailed(record.mediaStoreId, e.message ?: "Google Drive error")
+        } catch (e: StorageException) {
+            repository.markFailed(current.mediaStoreId, e.message ?: "$backendName error")
             return ItemResult.DONE
         } catch (e: IOException) {
-            repository.requeue(record.mediaStoreId)
+            repository.requeue(current.mediaStoreId)
             return ItemResult.RETRY
         }
 
         // Invariant #2: the bytes on Drive must be the bytes we hashed. If the file
         // changed underneath the upload, the result is untrustworthy — discard it.
-        val after = localFiles.stat(record)
+        val after = localFiles.stat(current)
         if (after != md5Stat) {
-            repository.requeueModified(record.mediaStoreId)
+            repository.requeueModified(current.mediaStoreId)
             return ItemResult.RETRY
         }
 
+        val backendId = backend.id.name
         when (outcome) {
-            is DriveUploader.Outcome.Verified -> {
+            is StorageBackend.Outcome.Verified -> {
                 repository.markSynced(
-                    record.mediaStoreId, outcome.fileId, outcome.driveMd5, System.currentTimeMillis()
+                    current.mediaStoreId, backendId, outcome.objectId, outcome.remoteChecksum,
+                    System.currentTimeMillis()
                 )
                 return ItemResult.DONE
             }
-            is DriveUploader.Outcome.Md5Mismatch -> {
+            is StorageBackend.Outcome.ChecksumMismatch -> {
                 repository.markFailed(
-                    record.mediaStoreId,
-                    "Checksum mismatch after upload (drive=${outcome.driveMd5}) — not marked synced",
-                    driveFileId = outcome.fileId
+                    current.mediaStoreId,
+                    "Checksum mismatch after upload (stored=${outcome.remoteChecksum}) — not marked synced",
+                    driveFileId = outcome.objectId
                 )
                 return ItemResult.DONE
             }
-            is DriveUploader.Outcome.Unverified -> {
-                // Drive hasn't computed the checksum yet (large files). Stay UPLOADING
-                // and retry later; verifyExisting picks it up on the next run.
-                repository.markUnverified(record.mediaStoreId, outcome.fileId)
+            is StorageBackend.Outcome.Unverified -> {
+                // The backend accepted the bytes but cannot yet attest a matching checksum.
+                // Stay UPLOADING and retry later; verifyExisting picks it up on the next run.
+                repository.markUnverified(current.mediaStoreId, backendId, outcome.objectId)
                 return ItemResult.RETRY
             }
         }
     }
 
+    /**
+     * Uploads [record], or adopts an identical object already proven in storage.
+     * [expectedChecksum] is what the stored bytes must report back, which for a backend
+     * whose checksum depends on upload chunking is not the local file's plain MD5.
+     */
     private suspend fun runUpload(
         record: SyncRecord,
-        md5: String,
+        backend: StorageBackend,
+        expectedChecksum: String,
         md5Stat: LocalFiles.Stat
-    ): DriveUploader.Outcome {
-        // A stale UPLOADING row with a Drive file id but no session finished uploading
+    ): StorageBackend.Outcome {
+        // A stale UPLOADING row with a remote object but no session finished uploading
         // before the process died — only the checksum verification is outstanding.
         if (record.status == SyncStatus.UPLOADING && record.driveFileId != null && record.resumeSessionUri == null) {
             try {
-                return uploader.verifyExisting(record.driveFileId, md5)
-            } catch (e: DriveException.NotFound) {
-                // File vanished on Drive; fall through and upload it again
+                return backend.verifyExisting(record.driveFileId, expectedChecksum)
+            } catch (e: StorageException.NotFound) {
+                // The remote copy is gone; fall through and upload it again
             }
         }
-        // Content dedup (§4.4): identical bytes already verified on Drive — moved,
-        // renamed, or duplicated locally — are adopted with one GET, never re-uploaded.
+        // Content dedup (§4.4): identical bytes already verified in storage — moved,
+        // renamed, or duplicated locally — are adopted with one HEAD, never re-uploaded.
         if (record.resumeSessionUri == null) {
-            repository.lookupUploaded(md5)?.let { prior ->
+            repository.lookupUploaded(backend.id.name, expectedChecksum)?.let { prior ->
                 try {
-                    val outcome = uploader.verifyExisting(prior.driveFileId, md5)
-                    if (outcome is DriveUploader.Outcome.Verified) return outcome
-                    repository.forgetUploaded(md5) // ledger entry no longer trustworthy
-                } catch (e: DriveException.NotFound) {
-                    repository.forgetUploaded(md5) // Drive copy was deleted
+                    val outcome = backend.verifyExisting(prior.driveFileId, expectedChecksum)
+                    if (outcome is StorageBackend.Outcome.Verified) return outcome
+                    repository.forgetUploaded(backend.id.name, expectedChecksum) // ledger entry no longer trustworthy
+                } catch (e: StorageException.NotFound) {
+                    repository.forgetUploaded(backend.id.name, expectedChecksum) // remote copy was deleted
                 }
             }
         }
@@ -187,14 +208,15 @@ class SyncWorker @AssistedInject constructor(
                 }
             }
             try {
-                uploader.upload(
-                    DriveUploader.UploadRequest(
+                backend.upload(
+                    StorageBackend.UploadRequest(
                         fileName = record.fileName,
                         mimeType = record.mimeType,
                         sizeBytes = md5Stat.sizeBytes,
-                        localMd5 = md5,
-                        parentFolderId = folderResolver.resolveFolderId(record),
-                        existingSessionUri = record.resumeSessionUri
+                        localChecksum = expectedChecksum,
+                        destinationId = destinationResolver.resolveDestinationId(record),
+                        existingSession = record.resumeSessionUri,
+                        uniqueId = record.mediaStoreId.toString()
                     ),
                     { offset -> localFiles.open(record, offset) },
                     onSessionEstablished = { repository.saveSessionUri(record.mediaStoreId, it) },
@@ -245,7 +267,7 @@ class SyncWorker @AssistedInject constructor(
             NotificationChannel(CHANNEL_ID, "Upload progress", NotificationManager.IMPORTANCE_LOW)
         )
         val notification = NotificationCompat.Builder(applicationContext, CHANNEL_ID)
-            .setContentTitle("Uploading to Google Drive")
+            .setContentTitle("Uploading")
             .setSmallIcon(android.R.drawable.stat_sys_upload)
             .setOngoing(true)
             .build()
