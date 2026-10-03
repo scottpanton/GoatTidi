@@ -38,6 +38,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.style.TextOverflow
 import com.goattidi.mediasync.data.db.SyncStatus
 import com.goattidi.mediasync.data.repo.DriveLayout
+import com.goattidi.mediasync.data.repo.S3Settings
+import com.goattidi.mediasync.data.storage.BackendId
 
 private fun layoutLabel(layout: DriveLayout): String = when (layout) {
     DriveLayout.FLAT -> "All in one folder"
@@ -45,13 +47,14 @@ private fun layoutLabel(layout: DriveLayout): String = when (layout) {
     DriveLayout.MIRROR_LOCAL -> "By source folder (Camera, WhatsApp…)"
 }
 
-/** Names the folders sync detection covers, so the text changes with the toggle and folder. */
+/** Names the containers sync detection covers, so the text changes with the toggle and folder. */
 private fun syncDetectionDescription(state: MainViewModel.UiState): String {
     val base = "Files this app uploaded stay synced even if you move them out of ${state.folderName}/."
+    val where = if (state.backendId == BackendId.DRIVE) "your Drive" else "your bucket"
     return when {
         state.dedupFolder.isBlank() -> base
-        state.syncSearchEntireDrive ->
-            "$base Files already anywhere in your Drive are recognized too, so they aren't uploaded twice."
+        state.syncSearchWholeBackend ->
+            "$base Files already anywhere in $where are recognized too, so they aren't uploaded twice."
         else -> "$base Files already in ${state.dedupFolder}/ are recognized too, so they aren't uploaded twice."
     }
 }
@@ -74,36 +77,43 @@ fun SettingsContent(state: MainViewModel.UiState, viewModel: MainViewModel) {
         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text("Google Drive account", style = MaterialTheme.typography.titleMedium)
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            Text(
-                when (state.driveConnected) {
-                    null -> "Checking…"
-                    true -> state.driveAccountEmail?.let { "✓ Connected as $it" } ?: "✓ Connected"
-                    false -> "Not connected — uploads wait until you connect"
-                },
-                style = MaterialTheme.typography.bodyMedium,
-                color = when (state.driveConnected) {
-                    true -> statusColor(SyncStatus.SYNCED)
-                    false -> MaterialTheme.colorScheme.error
-                    null -> MaterialTheme.colorScheme.onSurfaceVariant
-                },
-                modifier = Modifier.weight(1f)
-            )
-            if (state.driveConnected == false) {
-                TextButton(onClick = { viewModel.connectDrive() }) { Text("Connect Google Drive") }
+        Text("Storage backend", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "Where uploads are sent. Files already uploaded stay where they are; switching " +
+                "only affects future uploads.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        BackendId.entries.forEach { id ->
+            val label = if (id == BackendId.DRIVE) "Google Drive" else "S3-compatible storage"
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().clickable { viewModel.selectBackend(id) }
+            ) {
+                RadioButton(selected = state.backendId == id, onClick = { viewModel.selectBackend(id) })
+                Text(label)
             }
         }
 
         HorizontalDivider()
 
-        Text("Google Drive destination", style = MaterialTheme.typography.titleMedium)
+        if (state.backendId == BackendId.S3) {
+            S3SettingsSection(state.s3Settings, viewModel)
+            HorizontalDivider()
+        }
+
+        if (state.backendId == BackendId.DRIVE) {
+            GoogleDriveAccountSection(state, viewModel)
+            HorizontalDivider()
+        }
+
+        Text("Destination in ${state.backendName}", style = MaterialTheme.typography.titleMedium)
         // Save lives inside the field and appears only once the name actually changes
         val folderNameChanged = folderName.isNotBlank() && folderName.trim() != state.folderName
         OutlinedTextField(
             value = folderName,
             onValueChange = { folderName = it },
-            label = { Text("New Folder Name") },
+            label = { Text(if (state.backendId == BackendId.DRIVE) "Folder name" else "Prefix") },
             singleLine = true,
             trailingIcon = if (folderNameChanged) {
                 { TextButton(onClick = { viewModel.saveFolderName(folderName) }) { Text("Save") } }
@@ -164,8 +174,13 @@ fun SettingsContent(state: MainViewModel.UiState, viewModel: MainViewModel) {
             Column(Modifier.weight(1f)) {
                 Text("Expand sync search to other folders")
                 Text(
-                    "Avoid duplicate uploads by finding files already on your Drive. " +
-                        "Asks Google for read-only access to your Drive.",
+                    if (state.backendId == BackendId.DRIVE) {
+                        "Avoid duplicate uploads by finding files already on your Drive. " +
+                            "Asks Google for read-only access to your Drive."
+                    } else {
+                        "Avoid duplicate uploads by finding files already in your bucket. " +
+                            "Uses the key you entered above — no extra permission needed."
+                    },
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -174,7 +189,7 @@ fun SettingsContent(state: MainViewModel.UiState, viewModel: MainViewModel) {
         }
         if (expanded) {
             TextButton(onClick = { viewModel.openFolderPicker() }) {
-                Text(if (state.syncSearchEntireDrive) "Choose Drive folder…" else "Change Drive folder…")
+                Text(if (state.syncSearchWholeBackend) chooseContainerLabel(state) else changeContainerLabel(state))
             }
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                 Text(
@@ -263,5 +278,139 @@ private fun FolderPickerDialog(picker: MainViewModel.FolderPicker, viewModel: Ma
         dismissButton = {
             TextButton(onClick = { viewModel.pickerDismiss() }) { Text("Cancel") }
         }
+    )
+}
+
+/** The container a backend calls its whole scope; the labels differ, the role does not. */
+private fun chooseContainerLabel(state: MainViewModel.UiState): String =
+    if (state.backendId == BackendId.DRIVE) "Choose Drive folder…" else "Choose prefix…"
+
+private fun changeContainerLabel(state: MainViewModel.UiState): String =
+    if (state.backendId == BackendId.DRIVE) "Change Drive folder…" else "Change prefix…"
+
+/** Drive's account status, shown only while Drive is the selected backend. */
+@Composable
+private fun GoogleDriveAccountSection(state: MainViewModel.UiState, viewModel: MainViewModel) {
+    Text("Google Drive account", style = MaterialTheme.typography.titleMedium)
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+        Text(
+            when (state.driveConnected) {
+                null -> "Checking…"
+                true -> state.driveAccountEmail?.let { "✓ Connected as $it" } ?: "✓ Connected"
+                false -> "Not connected — uploads wait until you connect"
+            },
+            style = MaterialTheme.typography.bodyMedium,
+            color = when (state.driveConnected) {
+                true -> statusColor(SyncStatus.SYNCED)
+                false -> MaterialTheme.colorScheme.error
+                null -> MaterialTheme.colorScheme.onSurfaceVariant
+            },
+            modifier = Modifier.weight(1f)
+        )
+        if (state.driveConnected == false) {
+            TextButton(onClick = { viewModel.connectDrive() }) { Text("Connect Google Drive") }
+        }
+    }
+}
+
+/**
+ * Endpoint details for an S3-compatible service.
+ *
+ * Deliberately plain text fields rather than a credential picker: S3-compatible services
+ * are self-hosted far more often than they are AWS, and there is no common identity provider
+ * to offer. Path-style addressing is on by default because it is what MinIO and most
+ * gateways expect.
+ */
+@Composable
+private fun S3SettingsSection(current: S3Settings, viewModel: MainViewModel) {
+    var endpoint by remember(current.endpoint) { mutableStateOf(current.endpoint) }
+    var region by remember(current.region) { mutableStateOf(current.region) }
+    var bucket by remember(current.bucket) { mutableStateOf(current.bucket) }
+    var accessKeyId by remember(current.accessKeyId) { mutableStateOf(current.accessKeyId) }
+    var secretAccessKey by remember(current.secretAccessKey) { mutableStateOf(current.secretAccessKey) }
+    var sessionToken by remember(current.sessionToken) { mutableStateOf(current.sessionToken) }
+    var pathStyle by remember(current.pathStyle) { mutableStateOf(current.pathStyle) }
+    val focusManager = LocalFocusManager.current
+
+    Text("S3 connection", style = MaterialTheme.typography.titleMedium)
+    Text(
+        "Works with AWS S3, Cloudflare R2, Backblaze B2, MinIO and other S3-compatible services. " +
+            "Give the app a key that can read and write only this bucket.",
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+
+    fun save() = viewModel.saveS3Settings(
+        S3Settings(
+            endpoint = endpoint.trim(),
+            region = region.trim(),
+            bucket = bucket.trim(),
+            accessKeyId = accessKeyId.trim(),
+            secretAccessKey = secretAccessKey.trim(),
+            sessionToken = sessionToken.trim(),
+            pathStyle = pathStyle
+        )
+    )
+
+    S3Field("Endpoint", endpoint, { endpoint = it }, "https://s3.example.com", focusManager, ::save)
+    S3Field("Region", region, { region = it }, "us-east-1", focusManager, ::save)
+    S3Field("Bucket", bucket, { bucket = it }, "my-media", focusManager, ::save)
+    S3Field("Access key ID", accessKeyId, { accessKeyId = it }, "AKIA…", focusManager, ::save)
+    S3Field("Secret access key", secretAccessKey, { secretAccessKey = it }, "", focusManager, ::save)
+    S3Field(
+        "Session token (optional)", sessionToken, { sessionToken = it },
+        "only for temporary credentials", focusManager, ::save
+    )
+
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.weight(1f)) {
+            Text("Path-style addressing")
+            Text(
+                "Bucket as a path segment instead of a subdomain. Leave on for MinIO and " +
+                    "most self-hosted services.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Switch(checked = pathStyle, onCheckedChange = { pathStyle = it })
+    }
+
+    TextButton(
+        onClick = {
+            save()
+            focusManager.clearFocus()
+        },
+        enabled = endpoint.isNotBlank() && bucket.isNotBlank()
+    ) { Text("Save and test") }
+}
+
+@Composable
+private fun S3Field(
+    label: String,
+    value: String,
+    onChange: (String) -> Unit,
+    placeholder: String,
+    focusManager: androidx.compose.ui.focus.FocusManager,
+    onSave: () -> Unit
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onChange,
+        label = { Text(label) },
+        placeholder = { if (placeholder.isNotEmpty()) Text(placeholder) },
+        singleLine = true,
+        visualTransformation = if (label.contains("Secret")) {
+            androidx.compose.ui.text.input.PasswordVisualTransformation()
+        } else {
+            androidx.compose.ui.text.input.VisualTransformation.None
+        },
+        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+        keyboardActions = KeyboardActions(
+            onDone = {
+                onSave()
+                focusManager.clearFocus()
+            }
+        ),
+        modifier = Modifier.fillMaxWidth()
     )
 }

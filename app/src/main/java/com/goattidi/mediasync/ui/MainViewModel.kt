@@ -14,8 +14,12 @@ import com.goattidi.mediasync.data.drive.DriveAuthProvider
 import com.goattidi.mediasync.data.drive.DriveClient
 import com.goattidi.mediasync.data.drive.DriveException
 import com.goattidi.mediasync.data.drive.DriveFile
+import com.goattidi.mediasync.data.storage.BackendId
+import com.goattidi.mediasync.data.storage.RemoteObject
+import com.goattidi.mediasync.data.storage.StorageException
 import com.goattidi.mediasync.data.storage.StorageRouter
 import com.goattidi.mediasync.data.repo.DriveLayout
+import com.goattidi.mediasync.data.repo.S3Settings
 import com.goattidi.mediasync.data.repo.SyncSettings
 import com.goattidi.mediasync.data.repo.SyncStateRepository
 import com.goattidi.mediasync.sync.ReclaimEngine
@@ -81,10 +85,14 @@ class MainViewModel @Inject constructor(
     private val storageRouter: StorageRouter
 ) : ViewModel() {
 
-    /** One level of the Drive folder browser. Breadcrumb starts at ("root", "My Drive"). */
+    /**
+     * One level of the destination browser: Drive folders or S3 prefixes, behind the same
+     * neutral type. The breadcrumb's first entry is the backend root, whose id and label
+     * are the backend's own.
+     */
     data class FolderPicker(
         val breadcrumb: List<Pair<String, String>>,
-        val folders: List<DriveFile> = emptyList(),
+        val folders: List<RemoteObject> = emptyList(),
         val loading: Boolean = true
     )
 
@@ -104,6 +112,9 @@ class MainViewModel @Inject constructor(
         val reclaimCandidates: List<SyncRecord> = emptyList(),
         val folderName: String = "",
         val layout: DriveLayout = DriveLayout.FLAT,
+        val backendId: BackendId = BackendId.DRIVE,
+        val backendName: String = "Google Drive",
+        val s3Settings: S3Settings = S3Settings(),
         val wifiOnly: Boolean = true,
         val chargingOnly: Boolean = false,
         val dedupFolder: String = "",
@@ -112,8 +123,8 @@ class MainViewModel @Inject constructor(
         val driveConnected: Boolean? = null,
         /** Email of the connected Drive account; null if not connected or not yet known. */
         val driveAccountEmail: String? = null,
-        /** Sync search covers the whole Drive (the default once expanded) rather than one folder. */
-        val syncSearchEntireDrive: Boolean = false,
+        /** Sync search covers the whole bucket/account (the default once expanded) rather than one container. */
+        val syncSearchWholeBackend: Boolean = false,
         /** When the sync-search index was last rebuilt (epoch ms); 0 = never. */
         val lastSyncScanAt: Long = 0,
         val syncScanning: Boolean = false,
@@ -153,12 +164,22 @@ class MainViewModel @Inject constructor(
         val layout: DriveLayout,
         val wifiOnly: Boolean,
         val chargingOnly: Boolean,
-        val dedupFolder: String
+        val dedupFolder: String,
+        val backendId: BackendId,
+        val s3Settings: S3Settings
     )
 
+    // Two stages: combine() has typed overloads only up to five flows, and the backend
+    // choice is a separate concern from the upload preferences anyway.
     private val prefs = combine(
-        settings.folderName, settings.layout, settings.wifiOnly, settings.chargingOnly, settings.dedupFolder
-    ) { name, layout, wifi, charging, dedup -> Prefs(name, layout, wifi, charging, dedup) }
+        combine(
+            settings.folderName, settings.layout, settings.wifiOnly, settings.chargingOnly,
+            settings.dedupFolder
+        ) { name, layout, wifi, charging, dedup ->
+            Prefs(name, layout, wifi, charging, dedup, BackendId.DRIVE, S3Settings())
+        },
+        combine(settings.backendId, settings.s3Settings) { backend, s3 -> backend to s3 }
+    ) { base, (backend, s3) -> base.copy(backendId = backend, s3Settings = s3) }
 
     val state: StateFlow<UiState> = combine(repository.observeAll(), prefs, ui) { records, p, s ->
         val visible = records
@@ -174,6 +195,9 @@ class MainViewModel @Inject constructor(
             wifiOnly = p.wifiOnly,
             chargingOnly = p.chargingOnly,
             dedupFolder = p.dedupFolder,
+            backendId = p.backendId,
+            backendName = if (p.backendId == BackendId.DRIVE) "Google Drive" else "S3",
+            s3Settings = p.s3Settings,
             reclaimCandidates = ReclaimEngine.candidatesFrom(records),
             queue = records
                 .filter {
@@ -273,7 +297,7 @@ class MainViewModel @Inject constructor(
             if (authError == null) runCatching { ensureOwnLedger() }
             scheduler.scheduleNow(settings.wifiOnly.first(), settings.chargingOnly.first())
             if (authError != null) {
-                val text = driveErrorMessage(authError)
+                val text = storageErrorMessage(authError)
                 ui.update { it.copy(driveConnected = false, driveAccountEmail = null, message = text) }
             }
         }
@@ -294,33 +318,37 @@ class MainViewModel @Inject constructor(
                 "Verify: ${s.confirmedSynced} confirmed, ${s.orphaned} orphaned, " +
                     "${s.modified} modified, ${s.stillUnverified} unverified of ${s.checked}"
             } catch (e: Exception) {
-                driveErrorMessage(e)
+                storageErrorMessage(e)
             }
             ui.update { it.copy(busy = false, message = text) }
         }
     }
 
-    // ---- Drive folder picker ----
+    // ---- Destination browser (Drive folders or S3 prefixes) ----
 
     /**
-     * Browsing the user's folders is the one place the app needs drive.readonly, so the
-     * opt-in grant is requested here — never at connect time.
+     * Opens the browser for the sync-search container.
+     *
+     * Browsing the user's Drive folders is the one place the app needs drive.readonly, so
+     * the opt-in grant is requested here — never at connect time. An S3 prefix needs no
+     * equivalent, since the credentials already grant the listing.
      */
     fun openFolderPicker() {
         viewModelScope.launch {
             try {
-                authProvider.authorizeExternalRead()
-                settings.setExternalReadEnabled(true)
-                loadPickerLevel(listOf(DRIVE_ROOT_ID to ENTIRE_DRIVE_LABEL))
+                if (settings.backendId.first() == BackendId.DRIVE) {
+                    authProvider.authorizeExternalRead()
+                    settings.setExternalReadEnabled(true)
+                }
+                loadPickerLevel(listOf(rootContainerId() to rootContainerLabel()))
             } catch (e: Exception) {
                 if (e is DriveAuthConsentRequired) afterConsent = ::openFolderPicker
-                val text = driveErrorMessage(e)
-                ui.update { it.copy(message = text) }
+                ui.update { it.copy(message = storageErrorMessage(e)) }
             }
         }
     }
 
-    fun pickerEnter(folder: DriveFile) {
+    fun pickerEnter(folder: RemoteObject) {
         val current = ui.value.folderPicker ?: return
         loadPickerLevel(current.breadcrumb + (folder.id to (folder.name ?: "(unnamed)")))
     }
@@ -341,8 +369,9 @@ class MainViewModel @Inject constructor(
     fun pickerSelect() {
         val picker = ui.value.folderPicker ?: return
         val (id, _) = picker.breadcrumb.last()
-        val path = picker.breadcrumb.drop(1).joinToString("/") { it.second }.ifEmpty { ENTIRE_DRIVE_LABEL }
         viewModelScope.launch {
+            val path = picker.breadcrumb.drop(1).joinToString("/") { it.second }
+                .ifEmpty { rootContainerLabel() }
             settings.setDedupFolder(path, id)
             ui.update { it.copy(folderPicker = null) }
             runSyncScan(announce = true)
@@ -355,19 +384,25 @@ class MainViewModel @Inject constructor(
         if (enabled) enableSyncSearch() else disableSyncSearch()
     }
 
-    /** Asks for drive.readonly, then searches the entire Drive until the user narrows it to a folder. */
+    /**
+     * Searches everything the backend can see until the user narrows it to a container.
+     * Drive needs drive.readonly for that, which is requested here; S3 does not.
+     */
     private fun enableSyncSearch() {
         viewModelScope.launch {
             try {
-                authProvider.authorizeExternalRead()
+                if (settings.backendId.first() == BackendId.DRIVE) {
+                    authProvider.authorizeExternalRead()
+                    settings.setExternalReadEnabled(true)
+                }
             } catch (e: Exception) {
                 if (e is DriveAuthConsentRequired) afterConsent = ::enableSyncSearch
-                val text = driveErrorMessage(e)
-                ui.update { it.copy(message = text) }
+                ui.update { it.copy(message = storageErrorMessage(e)) }
                 return@launch
             }
-            settings.setExternalReadEnabled(true)
-            settings.setDedupFolder(ENTIRE_DRIVE_LABEL, DRIVE_ROOT_ID)
+            // A blank id is the backend's whole scope: "root" for Drive, the bucket root
+            // for S3, whose prefixes need no lookup to resolve.
+            settings.setDedupFolder(rootContainerLabel(), rootContainerId())
             runSyncScan(announce = true)
         }
     }
@@ -378,7 +413,7 @@ class MainViewModel @Inject constructor(
             settings.setExternalReadEnabled(false)
             settings.setLastSyncScanAt(0)
             ui.update {
-                it.copy(message = "Sync search limited to this app's uploads — it no longer requests read access to your Drive")
+                it.copy(message = "Sync search limited to this app's uploads — it no longer searches ${ui.value.backendName}")
             }
         }
     }
@@ -397,26 +432,34 @@ class MainViewModel @Inject constructor(
         val text = try {
             val externalId = settings.dedupFolderId.first().trim()
             val externalPath = settings.dedupFolder.first().trim()
+            val isDrive = settings.backendId.first() == BackendId.DRIVE
+            val wholeScopeId = if (isDrive) DRIVE_ROOT_ID else ""
             val message = when {
-                // Own files across the whole Drive — this app's uploads included
-                externalId == DRIVE_ROOT_ID -> {
+                // Everything the backend can see — this app's uploads included
+                externalPath.isNotEmpty() && externalId == wholeScopeId -> {
                     val imported = verifyEngine.importEverything()
                     settings.setLastSyncScanAt(System.currentTimeMillis())
-                    "Sync search: indexed $imported file(s) across your Drive"
+                    "Sync search: indexed $imported file(s) across your ${ui.value.backendName}"
                 }
                 externalPath.isEmpty() -> {
                     val own = verifyEngine.importLedger()
                     "Sync search: indexed $own of this app's upload(s)"
                 }
                 else -> {
-                    // Installs from before the folder picker saved only a path: resolve it once,
-                    // then keep the id so later scans skip the lookup (and survive renames)
+                    // An S3 prefix is already the address, so only Drive has a stored path
+                    // that still needs resolving — once, then kept so later scans skip the
+                    // lookup and survive renames.
                     val folderId = externalId.takeIf { it.isNotEmpty() }
-                        ?: driveClient.resolveFolderPath(externalPath)?.also { settings.setDedupFolder(externalPath, it) }
+                        ?: if (isDrive) {
+                            driveClient.resolveFolderPath(externalPath)
+                                ?.also { settings.setDedupFolder(externalPath, it) }
+                        } else {
+                            externalPath
+                        }
                     val result = if (folderId != null) verifyEngine.scanOwnUploadsAndContainer(folderId)
                     else VerifyEngine.SyncScanResult(verifyEngine.importLedger(), null)
                     if (result.inContainer == null) {
-                        "Sync search folder \"$externalPath\" is gone from Drive — choose another"
+                        "Sync search folder \"$externalPath\" is gone from ${ui.value.backendName} — choose another"
                     } else {
                         settings.setLastSyncScanAt(System.currentTimeMillis())
                         "Sync search: indexed ${result.inContainer} file(s) in \"$externalPath\" and " +
@@ -427,7 +470,7 @@ class MainViewModel @Inject constructor(
             ledgerChecked = true
             message
         } catch (e: Exception) {
-            if (announce) driveErrorMessage(e) else null
+            if (announce) storageErrorMessage(e) else null
         }
         ui.update {
             it.copy(
@@ -438,7 +481,7 @@ class MainViewModel @Inject constructor(
         }
     }
 
-    /** App-open refresh so files added to Drive from elsewhere get picked up without a button. */
+    /** App-open refresh so files added to storage from elsewhere get picked up without a button. */
     private suspend fun refreshSyncSearchIfStale() {
         if (settings.dedupFolder.first().isBlank()) return
         val age = System.currentTimeMillis() - settings.lastSyncScanAt.first()
@@ -447,7 +490,7 @@ class MainViewModel @Inject constructor(
 
     /**
      * The ledger is empty after a reinstall or cleared app data; without a rebuild the
-     * worker would upload everything already on Drive a second time. Once per process.
+     * worker would upload everything already stored a second time. Once per process.
      */
     private suspend fun ensureOwnLedger() {
         if (ledgerChecked) return
@@ -459,13 +502,20 @@ class MainViewModel @Inject constructor(
         viewModelScope.launch {
             ui.update { it.copy(folderPicker = FolderPicker(breadcrumb)) }
             try {
-                val folders = driveClient.listFolders(breadcrumb.last().first)
+                val folders = storageRouter.backend().listChildContainers(breadcrumb.last().first).objects
                 ui.update { it.copy(folderPicker = FolderPicker(breadcrumb, folders, loading = false)) }
             } catch (e: Exception) {
-                ui.update { it.copy(folderPicker = null, message = driveErrorMessage(e)) }
+                ui.update { it.copy(folderPicker = null, message = storageErrorMessage(e)) }
             }
         }
     }
+
+    /** "root" is Drive's whole account; S3 has no alias for its bucket root, so "" is it. */
+    private suspend fun rootContainerId(): String =
+        if (settings.backendId.first() == BackendId.DRIVE) DRIVE_ROOT_ID else ""
+
+    private suspend fun rootContainerLabel(): String =
+        if (settings.backendId.first() == BackendId.DRIVE) ENTIRE_DRIVE_LABEL else ENTIRE_BUCKET_LABEL
 
     fun connectDrive() {
         viewModelScope.launch {
@@ -477,7 +527,7 @@ class MainViewModel @Inject constructor(
                 // Auth failures park the worker in backoff; don't make a waiting queue sit it out
                 rescheduleIfQueueActive()
             } catch (e: Exception) {
-                val text = driveErrorMessage(e)
+                val text = storageErrorMessage(e)
                 ui.update { it.copy(driveConnected = false, driveAccountEmail = null, message = text) }
             }
         }
@@ -566,7 +616,7 @@ class MainViewModel @Inject constructor(
         viewModelScope.launch {
             combine(settings.dedupFolderId, settings.lastSyncScanAt) { id, at -> id to at }
                 .collect { (id, at) ->
-                    ui.update { it.copy(syncSearchEntireDrive = id == DRIVE_ROOT_ID, lastSyncScanAt = at) }
+                    ui.update { it.copy(syncSearchWholeBackend = id == DRIVE_ROOT_ID, lastSyncScanAt = at) }
                 }
         }
         viewModelScope.launch { refreshSyncSearchIfStale() }
@@ -577,7 +627,7 @@ class MainViewModel @Inject constructor(
         viewModelScope.launch {
             ui.update { it.copy(busy = true) }
             when (val gate = try { reclaimEngine.confirmSafeToDelete(id) } catch (e: Exception) {
-                ReclaimEngine.Gate.Blocked(driveErrorMessage(e))
+                ReclaimEngine.Gate.Blocked(storageErrorMessage(e))
             }) {
                 is ReclaimEngine.Gate.Safe -> {
                     repository.getById(id)?.let {
@@ -609,7 +659,7 @@ class MainViewModel @Inject constructor(
                             candidate to try {
                                 reclaimEngine.confirmSafeToDelete(candidate.mediaStoreId)
                             } catch (e: Exception) {
-                                ReclaimEngine.Gate.Blocked(driveErrorMessage(e))
+                                ReclaimEngine.Gate.Blocked(storageErrorMessage(e))
                             }
                         }
                     }
@@ -658,23 +708,87 @@ class MainViewModel @Inject constructor(
 
     fun clearMessage() = ui.update { it.copy(message = null) }
 
-    private fun driveErrorMessage(e: Throwable): String = when (e) {
-        is DriveAuthConsentRequired -> {
-            ui.update { it.copy(consentIntent = e.pendingIntent) }
-            "Google Drive needs your authorization…"
+    /**
+     * Turns a backend failure into something worth reading in a snackbar. The service name
+     * comes from the backend that failed, so an S3 credential problem never reads as a
+     * Google Drive problem.
+     */
+    private fun storageErrorMessage(e: Throwable): String {
+        val name = ui.value.backendName
+        return when (e) {
+            is DriveAuthConsentRequired -> {
+                ui.update { it.copy(consentIntent = e.pendingIntent) }
+                "Google Drive needs your authorization…"
+            }
+            // Drive has its own specific cause here that would be meaningless elsewhere
+            is StorageException.ServiceDisabled ->
+                if (ui.value.backendId == BackendId.DRIVE) {
+                    "Drive API is not enabled for this app's Google Cloud project (see setup docs)"
+                } else {
+                    "$name is not set up yet — check its details in Settings"
+                }
+            is StorageException.StorageQuotaExceeded -> "$name storage is full"
+            is StorageException.AuthFailed -> "$name rejected the credentials — check them in Settings"
+            is StorageException -> "$name error: ${e.message}"
+            else -> "Error: ${e.message}"
         }
-        is DriveException.ServiceDisabled ->
-            "Drive API is not enabled for this app's Google Cloud project (see setup docs)"
-        is DriveException.StorageQuotaExceeded -> "Google Drive storage is full"
-        is DriveException -> "Google Drive error: ${e.message}"
-        else -> "Error: ${e.message}"
     }
 
     private suspend fun backendId(): String = storageRouter.backend().id.name
 
+    /**
+     * Switches the storage backend. Remote state the other one issued is dropped, so no
+     * record claims to be synced against a service it has never been sent to; the files
+     * themselves stay untouched and simply need uploading to the new backend.
+     */
+    fun selectBackend(id: BackendId) {
+        if (id == ui.value.backendId) return
+        viewModelScope.launch {
+            settings.setBackendId(id)
+            settings.setDedupFolder("", "")
+            settings.setLastSyncScanAt(0)
+            storageRouter.backend() // rebuilds, and clears the other backend's remote state
+            ledgerChecked = false
+            ui.update {
+                it.copy(
+                    backendId = id,
+                    backendName = if (id == BackendId.DRIVE) "Google Drive" else "S3",
+                    syncSearchWholeBackend = false,
+                    message = "Uploads will now go to ${if (id == BackendId.DRIVE) "Google Drive" else "S3"}"
+                )
+            }
+            runCatching { checkDriveConnection() }
+        }
+    }
+
+    fun saveS3Settings(value: S3Settings) {
+        viewModelScope.launch {
+            settings.setS3Settings(value)
+            settings.setBackendId(BackendId.S3)
+            ui.update { it.copy(s3Settings = value) }
+            storageRouter.backend() // rebuilds with the new details
+            ledgerChecked = false
+            // A failed request here means the details are wrong, and saying so is far more
+            // useful than waiting for the next upload to fail.
+            val check = runCatching { storageRouter.backend().identity() }
+            ui.update {
+                it.copy(
+                    message = if (check.isSuccess) {
+                        "S3 settings saved — ${check.getOrNull()}"
+                    } else {
+                        storageErrorMessage(check.exceptionOrNull()!!)
+                    }
+                )
+            }
+        }
+    }
+
     private companion object {
         /** Picker label for the top of My Drive; as the sync-search folder it means "entire Drive". */
         const val ENTIRE_DRIVE_LABEL = "My Drive"
+
+        /** The same role for S3, whose bucket root is reached with no prefix at all. */
+        const val ENTIRE_BUCKET_LABEL = "Whole bucket"
         const val SYNC_SCAN_MAX_AGE_MS = 24 * 60 * 60 * 1000L
         const val MEDIA_CHANGE_DEBOUNCE_MS = 1_000L
         const val MIN_REFRESH_INDICATOR_MS = 600L
