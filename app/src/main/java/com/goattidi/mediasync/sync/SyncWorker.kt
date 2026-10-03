@@ -16,7 +16,6 @@ import com.goattidi.mediasync.data.db.SyncStatus
 import com.goattidi.mediasync.data.drive.DriveAuthConsentRequired
 import com.goattidi.mediasync.data.hash.Md5
 import com.goattidi.mediasync.data.repo.SyncStateRepository
-import com.goattidi.mediasync.data.storage.BackendId
 import com.goattidi.mediasync.data.storage.StorageBackend
 import com.goattidi.mediasync.data.storage.StorageException
 import com.goattidi.mediasync.data.storage.StorageBackendProvider

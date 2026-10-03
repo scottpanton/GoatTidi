@@ -13,7 +13,6 @@ import com.goattidi.mediasync.data.drive.DriveAuthConsentRequired
 import com.goattidi.mediasync.data.drive.DriveAuthProvider
 import com.goattidi.mediasync.data.drive.DriveClient
 import com.goattidi.mediasync.data.drive.DriveException
-import com.goattidi.mediasync.data.drive.DriveFile
 import com.goattidi.mediasync.data.storage.BackendId
 import com.goattidi.mediasync.data.storage.RemoteObject
 import com.goattidi.mediasync.data.storage.StorageException
