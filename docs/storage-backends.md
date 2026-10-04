@@ -65,11 +65,40 @@ it from `ListParts` without re-reading the file.
 
 | Drive | S3 | Consequence |
 |---|---|---|
-| Trash, distinct from deletion | none | A deleted object makes a record ORPHANED directly |
+| Trash, distinct from deletion | no native trash | The conventional `.Trash/` prefix is recognised — see below |
 | Per-app file ownership (`isAppAuthorized`) | not expressible in a listing | Our uploads are recognised by sitting under the destination prefix. Objects carry an `x-amz-meta-goattidi-upload` marker too, but `ListObjects` does not return user metadata, so the prefix is what the scan actually uses |
 | Folder tree with `parents` | flat keys | A container is a key prefix. Every object reports the prefix it sits in, so one parent map still answers "is this inside that container" for both backends |
 | Two files may share a name in a folder | keys are unique | Keys carry the media id. Without it `IMG_0001.jpg` from two folders would target one key |
 | OAuth sign-in | static credentials | No Connect button for S3; the endpoint and key are the identity |
+
+## Trash
+
+S3 has no trash: a delete removes the key. Tools that want a way out move the object under a
+reserved prefix instead, and `S3Trash.PREFIX` is `.Trash/` — the default for `rclone
+--trash-dir`, `s3cmd` policy files, and Synology Hyper Backup, so files trashed by those
+tools are recognised as trashed rather than deleted.
+
+Recognising it buys the two things Drive provides natively:
+
+- `RemoteObject.trashed` becomes meaningful. `stat` reports `trashed = true` when an object
+  has moved to `.Trash/`, so **Free up space** can say the copy is in the trash instead of
+  merely gone. The extra request is only made after the object is already missing at its own
+  key, so the common path costs nothing.
+- Whole-bucket scans leave the trash out. Otherwise a bucket whose trash is larger than its
+  library would report thousands of deleted files as sync-detection candidates.
+
+Two deliberate limits:
+
+- **Nothing is written to the prefix.** GoatTidi has no remote-delete action, so there is
+  nothing to intercept; inventing one would be a separate feature with its own confirmation
+  flow. The reserved prefix is treated as read-only.
+- **Exclusion is client-side.** S3 can exclude a prefix by not listing past it, but not by
+  ignoring it, so a bucket full of trash costs some wasted pages. The continuation token
+  still advances past a page that filtered down to nothing, so the walk cannot terminate
+  early or skip a live object.
+
+The prefix is reserved rather than merely unused: a destination or file called `.Trash` is
+renamed on the way to a key, so the app cannot file its own uploads as deleted ones.
 
 ## Switching backends
 

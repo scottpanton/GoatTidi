@@ -302,6 +302,117 @@ class S3StorageBackendTest {
         assertTrue(byId.getValue("GoatTidi_Phone/2026-07/").isContainer)
     }
 
+@Test
+    fun `a whole-bucket listing leaves out the trash`() = runTest {
+        // Otherwise a bucket whose trash is bigger than its library would report thousands
+        // of deleted files as candidates for sync detection.
+        server.enqueue(listingXml(
+            "<Contents><Key>GoatTidi_Phone/a.jpg</Key><Size>10</Size><ETag>\"e1\"</ETag></Contents>" +
+                "<Contents><Key>.Trash/GoatTidi_Phone/a.jpg</Key><Size>10</Size><ETag>\"e2\"</ETag></Contents>" +
+                "<Contents><Key>.Trash/2026-07/old.jpg</Key><Size>10</Size><ETag>\"e3\"</ETag></Contents>"
+        ))
+
+        assertEquals(listOf("GoatTidi_Phone/a.jpg"), backend.listAllObjects().objects.map { it.id })
+    }
+
+    @Test
+    fun `an owned listing leaves out the trash too`() = runTest {
+        server.enqueue(listingXml(
+            "<Contents><Key>live.jpg</Key><Size>10</Size><ETag>\"e1\"</ETag></Contents>" +
+                "<Contents><Key>.Trash/live.jpg</Key><Size>10</Size><ETag>\"e2\"</ETag></Contents>"
+        ))
+
+        assertEquals(listOf("live.jpg"), backend.listObjectsOwnedByUser().objects.map { it.id })
+    }
+
+    @Test
+    fun `a page of nothing but trash still leaves the walk to continue`() = runTest {
+        // The continuation token has to advance past a page that filtered down to nothing,
+        // or the scan would stop early and never index live objects on later pages.
+        server.enqueue(
+            listingXml(
+                "<Contents><Key>.Trash/a.jpg</Key><Size>10</Size><ETag>\"e1\"</ETag></Contents>",
+                truncated = true, token = "PAGE2"
+            )
+        )
+        server.enqueue(
+            listingXml(
+                "<Contents><Key>GoatTidi_Phone/b.jpg</Key><Size>10</Size><ETag>\"e2\"</ETag></Contents>"
+            )
+        )
+
+        var token: String? = null
+        val seen = mutableListOf<String>()
+        do {
+            val page = backend.listAllObjects(token)
+            seen += page.objects.map { it.id }
+            token = page.nextPageToken
+        } while (token != null)
+
+        assertEquals(listOf("GoatTidi_Phone/b.jpg"), seen)
+    }
+
+    @Test
+    fun `the trash is never offered as a container to browse`() = runTest {
+        server.enqueue(listingXml(
+            "<CommonPrefixes><Prefix>GoatTidi_Phone/</Prefix></CommonPrefixes>" +
+                "<CommonPrefixes><Prefix>.Trash/</Prefix></CommonPrefixes>"
+        ))
+
+        assertEquals(listOf("GoatTidi_Phone/"), backend.listContainers().objects.map { it.id })
+    }
+
+    @Test
+    fun `an object found only in the trash is reported as trashed rather than gone`() = runTest {
+        // A HEAD carries no body; MockWebServer sending one would corrupt the next response
+        server.enqueue(MockResponse().setResponseCode(404))
+        server.enqueue(MockResponse().setResponseCode(200).setHeader("ETag", "\"still-here\""))
+
+        val remote = backend.stat("GoatTidi_Phone/a.jpg")
+
+        assertTrue("a recoverable copy must not read as gone", remote.trashed)
+        // The reported id is the one the record holds, not where the copy currently sits.
+        assertEquals("GoatTidi_Phone/a.jpg", remote.id)
+        assertEquals("still-here", remote.checksum)
+        assertEquals("/goattidi/GoatTidi_Phone/a.jpg", server.takeRequest().path)
+        assertEquals(
+            "the trash should be probed at the trashed key",
+            "/goattidi/.Trash/GoatTidi_Phone/a.jpg",
+            server.takeRequest().path
+        )
+    }
+
+    @Test
+    fun `an object missing from both its key and the trash is gone`() = runTest {
+        server.enqueue(MockResponse().setResponseCode(404))
+        server.enqueue(MockResponse().setResponseCode(404))
+
+        val gone = runCatching { backend.stat("GoatTidi_Phone/a.jpg") }
+
+        assertEquals(StorageException.NotFound::class, gone.exceptionOrNull()!!::class)
+    }
+
+    @Test
+    fun `an upload cannot land inside the trash even if the destination is named that`() = runTest {
+        server.enqueue(MockResponse().setResponseCode(200).setHeader("ETag", "\"${md5Hex(smallBytes)}\""))
+
+        upload(smallBytes, destinationId = ".Trash/")
+
+        val path = server.takeRequest().path!!
+        assertFalse("an upload must not be filed as deleted: $path", path.contains("/.Trash/"))
+        assertTrue("the reserved prefix should be renamed out of the way: $path", path.contains("_.Trash/"))
+    }
+
+    @Test
+    fun `a file whose name is the reserved prefix is renamed too`() = runTest {
+        server.enqueue(MockResponse().setResponseCode(200).setHeader("ETag", "\"${md5Hex(smallBytes)}\""))
+
+        upload(smallBytes, fileName = ".Trash")
+
+        val path = server.takeRequest().path!!
+        assertFalse("a file must not be filed as deleted: $path", path.contains("/.Trash/"))
+    }
+
     @Test
     fun `identity names the bucket and endpoint since there is no account`() = runTest {
         assertTrue(backend.identity().startsWith("goattidi @ "))
@@ -393,6 +504,19 @@ class S3StorageBackendTest {
         status = SyncStatus.QUEUED,
         failureReason = null,
         resumeSessionUri = null
+    )
+
+    private fun listingXml(
+        contents: String,
+        truncated: Boolean = false,
+        token: String? = null
+    ) = MockResponse().setResponseCode(200).setBody(
+        buildString {
+            append("<ListBucketResult><IsTruncated>").append(truncated).append("</IsTruncated>")
+            token?.let { append("<NextContinuationToken>").append(it).append("</NextContinuationToken>") }
+            append(contents)
+            append("</ListBucketResult>")
+        }
     )
 
     private fun patternedBytes(size: Int) = ByteArray(size) { (it % 251).toByte() }

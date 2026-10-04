@@ -7,6 +7,7 @@ import com.goattidi.mediasync.data.storage.s3.S3Config
 import com.goattidi.mediasync.data.storage.s3.S3ListResult
 import com.goattidi.mediasync.data.storage.s3.S3ObjectEntry
 import com.goattidi.mediasync.data.storage.s3.S3ObjectStat
+import com.goattidi.mediasync.data.storage.s3.S3Trash
 import com.goattidi.mediasync.data.storage.s3.S3UploadedPart
 import com.goattidi.mediasync.sync.LocalFiles
 import java.io.IOException
@@ -108,16 +109,28 @@ class S3StorageBackend(
         return outcomeFor(stat.etag, localChecksum, objectId)
     }
 
+    /**
+     * Fetches one object, distinguishing *gone* from *in the trash*.
+     *
+     * The trash is only consulted after the object is missing at its own key, so the extra
+     * request is paid on the rare path and never on the common one. It is worth it because
+     * the two cases mean different things to a user: a trashed copy can come back, a
+     * deleted one cannot.
+     */
     override suspend fun stat(objectId: String): RemoteObject {
         val stat = client.headObject(objectId)
+        if (stat != null) return stat.toRemoteObject()
+        val trashed = client.headObject(S3Trash.trashedKey(objectId))
             ?: throw StorageException.NotFound("No S3 object at $objectId")
-        return stat.toRemoteObject()
+        return trashed.toRemoteObject().copy(id = objectId, trashed = true)
     }
 
     /** Prefixes are created lazily, so this is string composition rather than a call. */
-    override suspend fun ensureContainer(name: String, parentId: String?): String =
-        (parentId?.takeIf { it.isNotBlank() }?.ensureTrailingSlash().orEmpty()) +
-            sanitize(name) + "/"
+    override suspend fun ensureContainer(name: String, parentId: String?): String {
+        val parent = parentId?.takeIf { it.isNotBlank() }?.let(::sanitizePrefix).orEmpty()
+        val child = sanitize(name)
+        return if (parent.isEmpty()) "$child/" else parent.ensureTrailingSlash() + child + "/"
+    }
 
     /**
      * A prefix "exists" as soon as the bucket answers for it. Confirming that here turns a
@@ -135,8 +148,7 @@ class S3StorageBackend(
      * folder tree here because a folder name is not an address; an S3 prefix is one.
      */
     override suspend fun resolveContainerPath(path: String): String =
-        path.trim('/').split('/').filter { it.isNotEmpty() }
-            .joinToString(separator = "/", postfix = "/")
+        sanitizePrefix(path).ensureTrailingSlash()
 
     override suspend fun listOwnObjects(pageToken: String?): RemotePage {
         val root = destinationRoot()
@@ -158,14 +170,28 @@ class S3StorageBackend(
     override suspend fun listContainers(pageToken: String?): RemotePage {
         val root = destinationRoot()
         val page = client.listObjects(delimiter = "/", continuationToken = pageToken)
-        return RemotePage(page.prefixes.map { it.toContainer(root) }, page.nextContinuationToken)
+        return RemotePage(page.prefixes.outsideTrashPrefixes().map { it.toContainer(root) }, page.nextContinuationToken)
     }
 
     override suspend fun listChildContainers(parentId: String): RemotePage {
         val root = destinationRoot()
         val page = client.listObjects(prefix = parentId.ensureTrailingSlash(), delimiter = "/")
-        return RemotePage(page.prefixes.map { it.toContainer(root) })
+        return RemotePage(page.prefixes.outsideTrashPrefixes().map { it.toContainer(root) })
     }
+
+    /**
+     * Drops trashed objects from a page.
+     *
+     * The continuation token still advances, so a bucket whose trash is larger than its
+     * live content costs some wasted pages but cannot terminate the walk early or skip a
+     * live object. S3 has no server-side exclusion to do better with: excluding a prefix
+     * means not listing past it.
+     */
+    private fun List<S3ObjectEntry>.outsideTrash(): List<S3ObjectEntry> =
+        filterNot { S3Trash.isTrashed(it.key) }
+
+    private fun List<String>.outsideTrashPrefixes(): List<String> =
+        filterNot { S3Trash.isTrashed(it) }
 
     /** There is no account to sign into; the bucket and endpoint are the identity. */
     override suspend fun identity(): String = "${config.bucket} @ ${config.baseUrl}"
@@ -305,19 +331,39 @@ var partNumber = stored.size + 1
      * files sharing a name in the same layout would target one key, and S3 cannot hold both.
      */
     private fun objectKey(request: StorageBackend.UploadRequest): String {
-        val prefix = request.destinationId?.takeIf { it.isNotBlank() }?.ensureTrailingSlash().orEmpty()
+        val prefix = request.destinationId?.let(::sanitizePrefix).orEmpty()
         val safeName = sanitize(request.fileName)
         val unique = request.uniqueId?.takeIf { it.isNotBlank() }
         return prefix + if (unique == null) safeName else "${unique}_$safeName"
     }
 
     /**
+     * Sanitises a whole prefix, segment by segment, so a configured destination cannot place
+     * uploads inside the trash — which would make the app's own files look deleted to it.
+     * Done here rather than in the resolver because this is the last point every key passes
+     * through, whichever caller built the prefix.
+     */
+    private fun sanitizePrefix(prefix: String): String {
+        val trailingSlash = prefix.endsWith("/")
+        val cleaned = prefix.trim('/')
+            .split('/')
+            .filter { it.isNotEmpty() }
+            .joinToString("/") { sanitize(it) }
+        return if (trailingSlash && cleaned.isNotEmpty()) "$cleaned/" else cleaned
+    }
+
+    /**
      * Strips what would change a key's shape: the "/" separator, and the "." / ".."
      * segments that RFC 3986 normalization resolves away.
+     *
+     * The trash prefix is reserved too. A destination or file called `.Trash` would put
+     * the app's own uploads where it looks for deleted files, which is confusing enough
+     * that it is worth renaming rather than allowing.
      */
     private fun sanitize(name: String): String {
         val cleaned = name.trim().replace('/', '_')
-        return cleaned.takeIf { it.isNotEmpty() && it != "." && it != ".." } ?: "file"
+        val usable = cleaned.takeIf { it.isNotEmpty() && it != "." && it != ".." } ?: "file"
+        return if (S3Trash.isReservedName(usable)) "_$usable" else usable
     }
 
     private fun String.ensureTrailingSlash(): String = if (endsWith("/")) this else "$this/"
@@ -339,7 +385,7 @@ var partNumber = stored.size + 1
         ourRoot: String?,
         everythingUnderRootIsOurs: Boolean
     ): RemotePage = RemotePage(
-        objects = objects.map { entry ->
+        objects = objects.outsideTrash().map { entry ->
             val object_ = entry.toRemoteObject()
             if (everythingUnderRootIsOurs) object_.copy(ownedByUs = true)
             else object_.copy(ownedByUs = isOurs(object_.id, ourRoot))
@@ -370,7 +416,7 @@ var partNumber = stored.size + 1
         // sitting under this app's destination root, which is where every upload lands.
         ownedByUs = false,
         ownedByUser = true,
-        trashed = false
+        trashed = S3Trash.isTrashed(key)
     )
 
     private suspend fun S3ObjectStat.toRemoteObject() = RemoteObject(
@@ -382,7 +428,7 @@ var partNumber = stored.size + 1
         isContainer = false,
         ownedByUs = isOurs(key, destinationRoot()),
         ownedByUser = true,
-        trashed = false
+        trashed = S3Trash.isTrashed(key)
     )
 
     /** Parts 1..k with none missing, so a resume can start at k+1. */
